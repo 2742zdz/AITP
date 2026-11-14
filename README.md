@@ -121,8 +121,10 @@ builds a preview of the six programs and the unsigned manifest.
    latest release (the one `aitp update` reads) only if its version is
    higher than the current latest; publishing an older version leaves the
    latest release as it is (the run's summary says so). Do not change the
-   draft while the publish run is running: it re-reads the draft right
-   before publishing, but cannot lock it.
+   draft, or which release is the latest, while the publish run is running:
+   it re-reads the draft right before publishing, but cannot lock it.
+   Publish runs of different tags run one at a time; while one runs, a
+   newer waiting one cancels an older waiting one (start that again).
 
 A failed tag run leaves no release or only a draft; delete the draft before
 building the tag again. A published release cannot be changed: fix a problem

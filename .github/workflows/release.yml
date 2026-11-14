@@ -547,19 +547,28 @@ jobs:
             [ "$(gh api "$endpoint" --jq .draft)" = false ] && break
             sleep 3
           done
-          gh api "$endpoint" > "$RUNNER_TEMP/published.json"
-          python3 -B scripts/github_release.py verify --dist dist --tag "$TAG" --state published "${names[@]}" \
-            < "$RUNNER_TEMP/published.json"
-          latest="$(latest_tag)"
           if [ "$make_latest" = true ]; then
             expected="$TAG"
           else
             expected="$previous"
           fi
-          if [ "$latest" != "$expected" ]; then
-            echo "::error::$TAG is published, but the latest release is '$latest', expected '$expected' (updates read the latest release)" >&2
-            exit 1
-          fi
+          # The published release and the latest release may show a little
+          # later than draft=false: check the final state a few times.
+          for attempt in 1 2 3 4 5 6 7 8 9 10; do
+            gh api "$endpoint" > "$RUNNER_TEMP/published.json"
+            state=0
+            python3 -B scripts/github_release.py verify --dist dist --tag "$TAG" --state published "${names[@]}" \
+              < "$RUNNER_TEMP/published.json" || state=$?
+            latest="$(latest_tag)"
+            if [ "$state" = 0 ] && [ "$latest" = "$expected" ]; then
+              break
+            fi
+            if [ "$attempt" = 10 ]; then
+              echo "::error::$TAG: published check status $state; the latest release is '$latest', expected '$expected' (updates read the latest release)" >&2
+              exit 1
+            fi
+            sleep 6
+          done
           if [ "$make_latest" = true ]; then
             echo "::notice::$TAG published (immutable) and is the latest release"
             echo "$TAG published (immutable); it is the latest release." >> "$GITHUB_STEP_SUMMARY"
