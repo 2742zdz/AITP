@@ -59,9 +59,10 @@ jobs:
       - name: Test the aitp program with the contract entries
         run: cargo test --locked --features contract --bin aitp
 
-      - name: Test the release manifest tool and the VSCode certificate helper
+      - name: Test the release tools and the VSCode certificate helper
         run: |
           python3 scripts/test_release_manifest.py
+          python3 scripts/test_release_tools.py
           node --test scripts/test_vscode_certificates.js
 
       # The release build (paths remapped, as published) runs, carries the
