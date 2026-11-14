@@ -11,7 +11,7 @@ Each program must
 * name no other distribution built on this kernel: the neutral test brand
   `ktest`, plus each name in AITP_TEST_FOREIGN_NAMES (comma-separated, the
   same variable the tests read), and
-* carry no path of the machine that built it: the given build directories
+* carry no path of the machine that built it (as UTF-8 or UTF-16LE text): the given build directories
   (each at least two levels deep), CARGO_TARGET_DIR, HOME, CARGO_HOME and
   RUSTUP_HOME, each also in its resolved form (build-release.sh maps them
   to the neutral /aitp/... prefixes).
@@ -147,15 +147,17 @@ def build_machine_paths(build_dirs: list[Path], environ=os.environ) -> list[str]
     return paths
 
 
-def names_path(view: bytes, path: str) -> bool:
-    """Whether `view` holds `path` anywhere outside a whole neutral prefix
-    (`/src` inside `/aitp/src/...` is the prefix itself, not a build path)."""
+def names_path(view: bytes, path: str, encoding: str = "utf-8") -> bool:
+    """Whether `view` holds `path` (in `encoding`) anywhere outside a whole
+    neutral prefix in the same encoding (`/src` inside `/aitp/src/...` is
+    the prefix itself, not a build path)."""
+    end_mark = NEUTRAL_PREFIX_END if encoding == "utf-8" else rb"(?=/\x00|\x00\x00|\Z)"
     neutral = {
         (match.start(), match.end())
         for prefix in NEUTRAL_PREFIXES
-        for match in re.finditer(re.escape(prefix.encode()) + NEUTRAL_PREFIX_END, view)
+        for match in re.finditer(re.escape(prefix.encode(encoding)) + end_mark, view)
     }
-    needle = path_view(path.encode())
+    needle = path_view(path.encode(encoding))
     start = view.find(needle)
     while start >= 0:
         end = start + len(needle)
@@ -163,6 +165,28 @@ def names_path(view: bytes, path: str) -> bool:
             return True
         start = view.find(needle, start + 1)
     return False
+
+
+def carries_path(view: bytes, path: str) -> bool:
+    """Whether `view` (path_view of a program) names `path` outside the
+    neutral prefixes, as UTF-8 or as UTF-16LE text (wide strings of Windows
+    C code, such as a widened __FILE__)."""
+    return names_path(view, path) or names_path(view, path, "utf-16-le")
+
+
+def path_context(data: bytes, paths: list[str], limit: int = 5) -> str:
+    """The first few occurrences of `paths` with the text around them, for
+    finding where they come from."""
+    view = path_view(data)
+    lines = []
+    for path in paths:
+        for needle in (path_view(path.encode()), path_view(path.encode("utf-16-le"))):
+            start = view.find(needle)
+            while start >= 0 and len(lines) < limit:
+                around = data[max(0, start - 80):start + len(needle) + 120]
+                lines.append(f"  at {start:#x}: {around!r}")
+                start = view.find(needle, start + 1)
+    return "\n".join(lines)
 
 
 def check(programs: list[Path], build_dirs: list[Path], environ=os.environ) -> None:
@@ -185,8 +209,8 @@ def check(programs: list[Path], build_dirs: list[Path], environ=os.environ) -> N
         view = path_view(data)
         found = [name for name in names if name.encode() in view]
         require(not found, f"{program} names another distribution: {found}")
-        found = [path for path in paths if names_path(view, path)]
-        require(not found, f"{program} carries build machine paths: {found}")
+        found = [path for path in paths if carries_path(view, path)]
+        require(not found, f"{program} carries build machine paths: {found}\n{path_context(data, found)}")
         try:
             tool.require_program_keys(program, keys)
         except tool.CheckError as error:

@@ -83,9 +83,52 @@ cargo test --locked
 ```
 
 `scripts/build-release.sh` builds the release program with the build
-machine's directories remapped to neutral `/aitp/...` prefixes, and
-`scripts/check_release.py` checks the result. The remapped build is
-currently verified for Linux GNU targets.
+machine's directories remapped to neutral `/aitp/...` prefixes,
+`scripts/check_release.py` checks its contents and `scripts/check_asset.py`
+its format. Release programs are static Linux (musl) programs for x86_64 and
+aarch64, macOS programs for x86_64 and arm64, and Windows programs for x86_64
+and arm64.
+
+## Releasing
+
+Releases are built by the `Release` workflow (`.github/workflows/release.yml`);
+the signing keys never enter CI. A pull request, or a run by hand on a branch,
+builds a preview of the six programs and the unsigned manifest.
+
+1. Set the version in `Cargo.toml` (and `Cargo.lock`) on `main`, then push the
+   tag `vX.Y.Z` for that commit. The workflow builds and checks the six
+   programs, writes `aitp-manifest.json` and uploads them to a **draft**
+   release; the run's summary lists the files' SHA-256 and the signing
+   command.
+2. On the offline signing machine, download `aitp-manifest.json` from the
+   draft, compare its SHA-256 with the run's summary, and sign it:
+
+   ```sh
+   minisign -S -l -s aitp-release.key -p aitp-release.pub -m aitp-manifest.json \
+       -x aitp-manifest.json.minisig -t "aitp-manifest X.Y.Z sha256:<manifest sha256>"
+   minisign -V -p aitp-release.pub -m aitp-manifest.json
+   ```
+
+3. Upload only `aitp-manifest.json.minisig` to the draft
+   (`gh release upload vX.Y.Z aitp-manifest.json.minisig`, or edit the draft).
+   Optionally check it first: `python3 scripts/release_manifest.py verify
+   --manifest aitp-manifest.json --dist <directory with the six programs>`.
+4. Publish: run the workflow on the tag with the confirmation
+   `gh workflow run Release --ref vX.Y.Z -f publish_confirmation='publish vX.Y.Z'`
+   and approve the `release` environment. It checks the draft against the
+   digests the tag run recorded and the signature against the keys built
+   into the program, then publishes the release (immutable). It becomes the
+   latest release (the one `aitp update` reads) only if its version is
+   higher than the current latest; publishing an older version leaves the
+   latest release as it is (the run's summary says so). Do not change the
+   draft, or which release is the latest, while the publish run is running:
+   it re-reads the draft right before publishing, but cannot lock it.
+   Publish runs of different tags run one at a time; while one runs, a
+   newer waiting one cancels an older waiting one (start that again).
+
+A failed tag run leaves no release or only a draft; delete the draft before
+building the tag again. A published release cannot be changed: fix a problem
+with a new version.
 
 ## License
 

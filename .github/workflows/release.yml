@@ -1,0 +1,578 @@
+name: Release
+
+# Three kinds of run, chosen by how the workflow starts (job "gate"):
+# - preview: a pull request, or a run by hand on a branch with
+#   publish_confirmation empty. Builds and checks the six programs and the
+#   unsigned manifest, uploads them as a workflow artifact; no release.
+# - draft: pushing a vX.Y.Z tag (on main, equal to the package version).
+#   The same build and checks, then a DRAFT release with the six programs
+#   and the unsigned aitp-manifest.json; their digests are recorded.
+#   Nothing is published and nothing is signed: the workflow never holds a
+#   signing key. The maintainer signs the manifest offline and uploads
+#   aitp-manifest.json.minisig to the draft (see README "Releasing").
+# - publish: a run by hand on that tag with publish_confirmation set to
+#   "publish <tag>", in the "release" environment (required reviewer).
+#   Checks the draft against the recorded digests and the signature against
+#   the keys built into the program, re-reads the draft and publishes it
+#   (immutable).
+# Pushing a tag alone never publishes anything. The confirmation guards
+# against an accidental publish; the environment's reviewer is the approval.
+on:
+  pull_request:
+    branches: [main]
+  push:
+    tags:
+      - 'v*'
+  workflow_dispatch:
+    inputs:
+      publish_confirmation:
+        description: 'Empty for a preview. To publish the draft of a vX.Y.Z tag, run on that tag and type: publish <tag>'
+        required: false
+        default: ''
+        type: string
+
+permissions:
+  contents: read
+
+# Every run block under bash -eo pipefail (also on Windows).
+defaults:
+  run:
+    shell: bash
+
+concurrency:
+  group: release-${{ github.ref }}
+  cancel-in-progress: ${{ !startsWith(github.ref, 'refs/tags/') }}
+
+env:
+  ASSETS: >-
+    aitp-linux-x86_64 aitp-linux-aarch64 aitp-macos-x86_64 aitp-macos-aarch64
+    aitp-windows-x86_64.exe aitp-windows-aarch64.exe
+
+jobs:
+  gate:
+    name: Release gate
+    runs-on: ubuntu-22.04
+    timeout-minutes: 5
+    permissions:
+      contents: read
+      actions: read
+    outputs:
+      mode: ${{ steps.mode.outputs.mode }}
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      - name: Choose preview, draft or publish
+        id: mode
+        env:
+          EVENT: ${{ github.event_name }}
+          REF: ${{ github.ref }}
+          REF_NAME: ${{ github.ref_name }}
+          CONFIRMATION: ${{ inputs.publish_confirmation }}
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          case "$EVENT:$REF" in
+            pull_request:*)
+              mode=preview ;;
+            push:refs/tags/v*)
+              mode=draft ;;
+            workflow_dispatch:refs/tags/v*)
+              if [ "$CONFIRMATION" != "publish $REF_NAME" ]; then
+                echo "::error::to publish, run on the tag with publish_confirmation: publish $REF_NAME" >&2
+                exit 1
+              fi
+              mode=publish ;;
+            workflow_dispatch:refs/heads/*)
+              if [ -n "$CONFIRMATION" ]; then
+                echo "::error::only a run on a vX.Y.Z tag publishes; leave publish_confirmation empty for a preview" >&2
+                exit 1
+              fi
+              mode=preview ;;
+            *)
+              echo "::error::unsupported trigger $EVENT on $REF" >&2
+              exit 1 ;;
+          esac
+          # No release-gate bypass anywhere in the repository (the name is
+          # split here so that this check does not find itself).
+          found=0
+          git grep -n "ALLOW_PLACEHOLDER""_SIGNING_KEY" -- . || found=$?
+          if [ "$found" != 1 ]; then
+            echo "::error::a placeholder signing key switch is named in the repository (git grep: $found)" >&2
+            exit 1
+          fi
+          if [ "$mode" != preview ]; then
+            version="$(python3 -B -c 'import sys; sys.path.insert(0, "scripts"); import release_manifest; print(release_manifest.cargo_version())')"
+            if [ "$REF_NAME" != "v$version" ]; then
+              echo "::error::tag $REF_NAME does not name the package version $version (expected v$version)" >&2
+              exit 1
+            fi
+            # A job that names an environment which does not exist creates
+            # it unprotected: publishing needs "release" with a reviewer.
+            if [ "$mode" = publish ]; then
+              reviewers="$(gh api "repos/$GITHUB_REPOSITORY/environments/release" \
+                --jq '[.protection_rules[]? | select(.type == "required_reviewers") | .reviewers[]?] | length')"
+              if ! [ "$reviewers" -ge 1 ] 2>/dev/null; then
+                echo "::error::environment 'release' has no required reviewer (found: '$reviewers')" >&2
+                exit 1
+              fi
+            fi
+            # The release tag points into main (tags are protected, main is
+            # never rewritten).
+            status="$(gh api "repos/$GITHUB_REPOSITORY/compare/$GITHUB_SHA...main" --jq .status)"
+            case "$status" in
+              identical | ahead) ;;
+              *)
+                echo "::error::$REF_NAME ($GITHUB_SHA) is not on main (compare status: $status)" >&2
+                exit 1 ;;
+            esac
+          fi
+          echo "mode=$mode" >>"$GITHUB_OUTPUT"
+          echo "mode: $mode"
+
+  build:
+    name: Build ${{ matrix.asset }}
+    needs: gate
+    if: needs.gate.outputs.mode == 'preview' || needs.gate.outputs.mode == 'draft'
+    timeout-minutes: 60
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - os: ubuntu-22.04
+            target: x86_64-unknown-linux-musl
+            asset: aitp-linux-x86_64
+          - os: ubuntu-22.04-arm
+            target: aarch64-unknown-linux-musl
+            asset: aitp-linux-aarch64
+          - os: macos-15-intel
+            target: x86_64-apple-darwin
+            asset: aitp-macos-x86_64
+          - os: macos-15
+            target: aarch64-apple-darwin
+            asset: aitp-macos-aarch64
+          - os: windows-latest
+            target: x86_64-pc-windows-msvc
+            asset: aitp-windows-x86_64.exe
+          # Built on x86_64 Windows; job "windows-arm64" runs it natively.
+          - os: windows-latest
+            target: aarch64-pc-windows-msvc
+            asset: aitp-windows-aarch64.exe
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      - uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97 # v7.0.0
+        with:
+          python-version: '3.12'
+
+      # No build cache: a release is built from scratch.
+      - uses: dtolnay/rust-toolchain@4be7066ada62dd38de10e7b70166bc74ed198c30
+        with:
+          toolchain: '1.97.0'
+          targets: ${{ matrix.target }}
+
+      - name: Install musl build tools
+        if: runner.os == 'Linux'
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends musl-tools linux-libc-dev
+
+      # The only way release programs are built (paths remapped, real keys).
+      - name: Build the release program
+        env:
+          CARGO_BUILD_JOBS: 2
+          PYTHON: python
+          TARGET: ${{ matrix.target }}
+          ASSET: ${{ matrix.asset }}
+        run: |
+          program="$(bash scripts/build-release.sh --locked --target "$TARGET")"
+          mkdir -p dist
+          cp "$program" "dist/$ASSET"
+          ls -l "dist/$ASSET"
+
+      # The contents (AITP brand data, real keys and no placeholder, no
+      # other distribution, no build machine path) and the format (static
+      # Linux, Mach-O, reproducible PE).
+      - name: Check the release program
+        env:
+          ASSET: ${{ matrix.asset }}
+        run: |
+          python -B scripts/check_release.py --build-dir "$GITHUB_WORKSPACE" "dist/$ASSET"
+          python -B scripts/check_asset.py "dist/$ASSET"
+
+      - name: Run the release program natively
+        if: matrix.target != 'aarch64-pc-windows-msvc'
+        env:
+          ASSET: ${{ matrix.asset }}
+        run: |
+          version="$(python -B -c 'import sys; sys.path.insert(0, "scripts"); import release_manifest; print(release_manifest.cargo_version())')"
+          chmod +x "dist/$ASSET"
+          reported="$("dist/$ASSET" --version)"
+          echo "$reported"
+          if [ "$reported" != "aitp $version" ]; then
+            echo "::error::the program reports '$reported', expected 'aitp $version'" >&2
+            exit 1
+          fi
+          "dist/$ASSET" --help >/dev/null
+
+      - name: Run with getrandom failing (old-kernel fallback)
+        if: runner.os == 'Linux'
+        env:
+          ASSET: ${{ matrix.asset }}
+        run: python3 -B scripts/test_linux_entropy.py --binary "dist/$ASSET"
+
+      # Control: the same musl build without the kernel headers aborts under
+      # the same check, so the check (and the headers) matter.
+      - name: Control - a musl build without the kernel headers fails the entropy check
+        if: matrix.target == 'x86_64-unknown-linux-musl'
+        env:
+          CARGO_BUILD_JOBS: 2
+          CARGO_TARGET_DIR: ${{ runner.temp }}/aitp-no-uapi
+          CC_x86_64_unknown_linux_musl: musl-gcc
+          TARGET: ${{ matrix.target }}
+        run: |
+          cargo build --locked --release --bin aitp --target "$TARGET"
+          status=0
+          python3 -B scripts/test_linux_entropy.py --binary "$CARGO_TARGET_DIR/$TARGET/release/aitp" \
+            > "$RUNNER_TEMP/control.log" 2>&1 || status=$?
+          tail -n 30 "$RUNNER_TEMP/control.log"
+          # 3: the program itself failed (not the check's own setup).
+          if [ "$status" != 3 ]; then
+            echo "::error::the entropy check of a musl build without the kernel headers exited $status, expected 3" >&2
+            exit 1
+          fi
+          # AWS-LC's own message when musl's getentropy() fails.
+          grep -F "getentropy failed" "$RUNNER_TEMP/control.log"
+
+      - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: ${{ matrix.asset }}
+          path: dist/${{ matrix.asset }}
+          if-no-files-found: error
+          retention-days: 7
+
+  windows-arm64:
+    name: Run aitp-windows-aarch64.exe natively
+    needs: build
+    runs-on: windows-11-arm
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      - uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4
+        with:
+          name: aitp-windows-aarch64.exe
+          path: dist
+
+      - name: Run the release program natively
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $PSNativeCommandUseErrorActionPreference = $true
+          $version = (Select-String -Path Cargo.toml -Pattern '^version = "([^"]+)"' | Select-Object -First 1).Matches[0].Groups[1].Value
+          $reported = (& ./dist/aitp-windows-aarch64.exe --version | Out-String).Trim()
+          Write-Output $reported
+          if ($reported -ne "aitp $version") { throw "the program reports '$reported', expected 'aitp $version'" }
+          & ./dist/aitp-windows-aarch64.exe --help | Out-Null
+          $arch = $env:PROCESSOR_ARCHITECTURE
+          if ($arch -ne 'ARM64') { throw "not an ARM64 runner: $arch" }
+
+  package:
+    name: Manifest and bundle
+    needs: [gate, build, windows-arm64]
+    if: needs.gate.outputs.mode == 'preview' || needs.gate.outputs.mode == 'draft'
+    runs-on: ubuntu-22.04
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      - uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97 # v7.0.0
+        with:
+          python-version: '3.12'
+
+      - uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4
+        with:
+          path: release-assets
+          # The six programs only (not a bundle of an earlier attempt).
+          pattern: aitp-[lmw]*
+
+      - name: Assemble, check and write the unsigned manifest
+        run: |
+          read -r -a assets <<<"$ASSETS"
+          mkdir dist
+          for asset in "${assets[@]}"; do
+            cp "release-assets/$asset/$asset" "dist/$asset"
+          done
+          [ "$(ls dist | wc -l)" -eq 6 ]
+          python3 -B scripts/check_asset.py "${assets[@]/#/dist/}"
+          python3 -B scripts/release_manifest.py generate --dist dist > "$RUNNER_TEMP/generate.txt"
+          cat "$RUNNER_TEMP/generate.txt"
+          # The release files; the publish run accepts only these digests.
+          (cd dist && sha256sum aitp-manifest.json "${assets[@]}") > release-digests.sha256
+          [ "$(wc -l < release-digests.sha256)" -eq 7 ]
+          cat release-digests.sha256
+          {
+            echo '### Release files (sha256)'
+            echo '```'
+            cat release-digests.sha256
+            echo '```'
+            echo '### Signing (offline)'
+            echo '```'
+            cat "$RUNNER_TEMP/generate.txt"
+            echo '```'
+          } >> "$GITHUB_STEP_SUMMARY"
+
+      - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: aitp-bundle-${{ github.run_id }}
+          path: |
+            dist/*
+            release-digests.sha256
+          if-no-files-found: error
+          retention-days: 7
+
+  draft:
+    name: Upload the draft release
+    needs: [gate, package]
+    if: needs.gate.outputs.mode == 'draft'
+    runs-on: ubuntu-22.04
+    timeout-minutes: 15
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      - uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97 # v7.0.0
+        with:
+          python-version: '3.12'
+
+      - uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4
+        with:
+          name: aitp-bundle-${{ github.run_id }}
+          path: bundle
+
+      - name: Check the bundle
+        run: |
+          [ "$(ls bundle/dist | wc -l)" -eq 7 ]
+          (cd bundle/dist && sha256sum --check --strict ../release-digests.sha256)
+          python3 -B scripts/release_manifest.py generate --dist bundle/dist --output "$RUNNER_TEMP/aitp-manifest.json" > /dev/null
+          cmp "$RUNNER_TEMP/aitp-manifest.json" bundle/dist/aitp-manifest.json
+
+      - name: Create the draft release
+        env:
+          GH_TOKEN: ${{ github.token }}
+          TAG: ${{ github.ref_name }}
+        run: |
+          read -r -a assets <<<"$ASSETS"
+          count="$(python3 -B scripts/github_release.py count --repository "$GITHUB_REPOSITORY" --tag "$TAG")"
+          if [ "$count" != 0 ]; then
+            echo "::error::a release of $TAG already exists ($count); delete the draft to build it again" >&2
+            exit 1
+          fi
+          manifest_sha256="$(sha256sum bundle/dist/aitp-manifest.json | cut -d' ' -f1)"
+          notes="$RUNNER_TEMP/notes.md"
+          {
+            echo "AITP $TAG."
+            echo
+            echo "Draft: the maintainer signs aitp-manifest.json (sha256 $manifest_sha256) offline and adds aitp-manifest.json.minisig before publishing."
+          } > "$notes"
+          gh release create "$TAG" --repo "$GITHUB_REPOSITORY" --draft --verify-tag \
+            --title "AITP $TAG" --notes-file "$notes" \
+            bundle/dist/aitp-manifest.json "${assets[@]/#/bundle/dist/}"
+
+      # The draft holds exactly the bundle's files; otherwise it is deleted.
+      - name: Check the draft release
+        env:
+          GH_TOKEN: ${{ github.token }}
+          TAG: ${{ github.ref_name }}
+        run: |
+          read -r -a assets <<<"$ASSETS"
+          names=(--asset aitp-manifest.json)
+          for asset in "${assets[@]}"; do names+=(--asset "$asset"); done
+          ids="$(gh api --paginate "repos/$GITHUB_REPOSITORY/releases?per_page=100" \
+            --jq ".[] | select(.tag_name == \"$TAG\") | .id")"
+          if ! [[ "$ids" =~ ^[0-9]+$ ]]; then
+            echo "::error::expected one release of $TAG, found: $ids" >&2
+            exit 1
+          fi
+          endpoint="repos/$GITHUB_REPOSITORY/releases/$ids"
+          gh api "$endpoint" > "$RUNNER_TEMP/draft.json"
+          if ! python3 -B scripts/github_release.py verify --dist bundle/dist --tag "$TAG" --state draft \
+              "${names[@]}" < "$RUNNER_TEMP/draft.json"; then
+            if [ "$(gh api "$endpoint" --jq .draft)" = true ]; then
+              gh api --method DELETE "$endpoint"
+            fi
+            exit 1
+          fi
+          echo "::notice::draft of $TAG ready. Sign aitp-manifest.json offline, upload aitp-manifest.json.minisig to the draft, then run: gh workflow run Release --ref $TAG -f publish_confirmation='publish $TAG'"
+
+      - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: release-digests
+          path: bundle/release-digests.sha256
+          if-no-files-found: error
+          retention-days: 90
+
+  publish:
+    name: Publish the signed draft
+    needs: gate
+    if: needs.gate.outputs.mode == 'publish'
+    environment: release
+    # One publish at a time across all tags (the latest release is shared);
+    # a running publish is never cancelled.
+    concurrency:
+      group: release-publish
+      cancel-in-progress: false
+    runs-on: ubuntu-22.04
+    timeout-minutes: 20
+    permissions:
+      contents: write
+      actions: read
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      - uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97 # v7.0.0
+        with:
+          python-version: '3.12'
+
+      # Only the one release of this tag, built by a successful tag run of
+      # this commit, with exactly the six programs, the manifest and its
+      # signature.
+      - name: Download the draft
+        id: fetch
+        env:
+          GH_TOKEN: ${{ github.token }}
+          TAG: ${{ github.ref_name }}
+        run: |
+          read -r -a assets <<<"$ASSETS"
+          names=(--asset aitp-manifest.json --asset aitp-manifest.json.minisig)
+          for asset in "${assets[@]}"; do names+=(--asset "$asset"); done
+          python3 -B scripts/github_release.py fetch --repository "$GITHUB_REPOSITORY" --tag "$TAG" \
+            --sha "$GITHUB_SHA" --dist dist --release-json "$RUNNER_TEMP/release.json" \
+            --github-output "$GITHUB_OUTPUT" \
+            "${names[@]}"
+
+      - name: Download the digests the tag run recorded
+        uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4
+        with:
+          name: release-digests
+          path: ${{ runner.temp }}/release-digests
+          run-id: ${{ steps.fetch.outputs.run_id }}
+          github-token: ${{ github.token }}
+
+      # The draft holds the files the tag run built and recorded; the
+      # manifest describes exactly them; the signature verifies with a key
+      # built into the program (never a placeholder) and the programs carry
+      # those keys; the programs pass the release checks again.
+      - name: Check the draft and its signature
+        env:
+          TAG: ${{ github.ref_name }}
+          STATE: ${{ steps.fetch.outputs.state }}
+        run: |
+          read -r -a assets <<<"$ASSETS"
+          names=(--asset aitp-manifest.json --asset aitp-manifest.json.minisig)
+          for asset in "${assets[@]}"; do names+=(--asset "$asset"); done
+          if [ "$STATE" != draft ]; then
+            echo "::error::the release of $TAG is $STATE, not a draft" >&2
+            exit 1
+          fi
+          digests="$RUNNER_TEMP/release-digests/release-digests.sha256"
+          [ "$(wc -l < "$digests")" -eq 7 ]
+          (cd dist && sha256sum --check --strict "$digests")
+          python3 -B scripts/release_manifest.py generate --dist dist --output "$RUNNER_TEMP/aitp-manifest.json" > /dev/null
+          cmp "$RUNNER_TEMP/aitp-manifest.json" dist/aitp-manifest.json
+          python3 -B scripts/release_manifest.py verify --manifest dist/aitp-manifest.json --dist dist
+          python3 -B scripts/check_asset.py "${assets[@]/#/dist/}"
+          python3 -B scripts/check_release.py --build-dir "$GITHUB_WORKSPACE" "${assets[@]/#/dist/}"
+          python3 -B scripts/github_release.py verify --dist dist --tag "$TAG" --state draft \
+            "${names[@]}" \
+            < "$RUNNER_TEMP/release.json"
+
+      - name: Publish the immutable release
+        env:
+          GH_TOKEN: ${{ github.token }}
+          TAG: ${{ github.ref_name }}
+          RELEASE_ID: ${{ steps.fetch.outputs.id }}
+        run: |
+          [[ "$RELEASE_ID" =~ ^[0-9]+$ ]]
+          read -r -a assets <<<"$ASSETS"
+          names=(--asset aitp-manifest.json --asset aitp-manifest.json.minisig)
+          for asset in "${assets[@]}"; do names+=(--asset "$asset"); done
+          endpoint="repos/$GITHUB_REPOSITORY/releases/$RELEASE_ID"
+
+          # Re-read the draft right before publishing: still a draft holding
+          # exactly the checked files.
+          gh api "$endpoint" > "$RUNNER_TEMP/before.json"
+          python3 -B scripts/github_release.py verify --dist dist --tag "$TAG" --state draft "${names[@]}" \
+            < "$RUNNER_TEMP/before.json"
+
+          # The tag of the latest release; empty when there is none (404).
+          latest_tag() {
+            local output status=0
+            output="$(gh api "repos/$GITHUB_REPOSITORY/releases/latest" --jq .tag_name 2> "$RUNNER_TEMP/latest.err")" || status=$?
+            if [ "$status" = 0 ]; then
+              printf '%s\n' "$output"
+            elif grep -q "HTTP 404" "$RUNNER_TEMP/latest.err"; then
+              printf '\n'
+            else
+              cat "$RUNNER_TEMP/latest.err" >&2
+              return 1
+            fi
+          }
+          # Only a higher version becomes the latest release (updates read
+          # the latest release): an older version published later does not
+          # take it back.
+          previous="$(latest_tag)"
+          make_latest="$(python3 -B scripts/github_release.py make-latest --tag "$TAG" --latest "$previous")"
+          echo "latest release before: ${previous:-none}; $TAG becomes the latest: $make_latest"
+
+          status=0
+          printf '{"draft":false,"prerelease":false,"make_latest":"%s"}' "$make_latest" |
+            gh api --method PATCH "$endpoint" --input - > /dev/null || status=$?
+          echo "publish request status: $status"
+          # Wait until GitHub reports it published; the checks below decide.
+          for _ in 1 2 3 4 5 6 7 8 9 10; do
+            [ "$(gh api "$endpoint" --jq .draft)" = false ] && break
+            sleep 3
+          done
+          if [ "$make_latest" = true ]; then
+            expected="$TAG"
+          else
+            expected="$previous"
+          fi
+          # The published release and the latest release may show a little
+          # later than draft=false: check the final state a few times.
+          for attempt in 1 2 3 4 5 6 7 8 9 10; do
+            gh api "$endpoint" > "$RUNNER_TEMP/published.json"
+            state=0
+            python3 -B scripts/github_release.py verify --dist dist --tag "$TAG" --state published "${names[@]}" \
+              < "$RUNNER_TEMP/published.json" || state=$?
+            latest="$(latest_tag)"
+            if [ "$state" = 0 ] && [ "$latest" = "$expected" ]; then
+              break
+            fi
+            if [ "$attempt" = 10 ]; then
+              echo "::error::$TAG: published check status $state; the latest release is '$latest', expected '$expected' (updates read the latest release)" >&2
+              exit 1
+            fi
+            sleep 6
+          done
+          if [ "$make_latest" = true ]; then
+            echo "::notice::$TAG published (immutable) and is the latest release"
+            echo "$TAG published (immutable); it is the latest release." >> "$GITHUB_STEP_SUMMARY"
+          else
+            echo "::warning::$TAG published (immutable) but NOT made the latest release: $previous is a higher version"
+            echo "$TAG published (immutable); NOT the latest release ($previous is a higher version), so updates do not offer it." >> "$GITHUB_STEP_SUMMARY"
+          fi
