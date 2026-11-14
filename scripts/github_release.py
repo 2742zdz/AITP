@@ -13,6 +13,12 @@
       writes the release JSON to FILE and appends id=, state= (draft or
       published) and run_id= (that tag run) to the GitHub output file.
 
+  github_release.py make-latest --tag TAG --latest LATEST
+      Prints "true" when TAG's version is higher than that of LATEST, the
+      tag of the current latest release (empty: none), else "false": a
+      release of an older version never becomes the latest (updates read
+      the latest release).
+
   github_release.py verify --dist DIR --tag TAG --state draft|published
                            --asset NAME [--asset NAME ...] < release.json
       The release has tag TAG, is a draft (not immutable) or published and
@@ -130,6 +136,22 @@ def fetch(args) -> None:
     print(f"fetched the {state} release {release['id']} of {args.tag} ({len(plan)} assets), built by run {run['id']}")
 
 
+def version(tag: str) -> tuple[int, int, int]:
+    match = TAG.fullmatch(tag)
+    require(match is not None, f"{tag!r} is not a vX.Y.Z tag")
+    return tuple(int(part) for part in match.groups())
+
+
+def make_latest(tag: str, latest: str) -> bool:
+    """Whether publishing `tag` should make it the latest release, given
+    the current latest release's tag (empty when there is none)."""
+    if not latest:
+        version(tag)
+        return True
+    require(version(tag) != version(latest), f"{tag} is already the latest release")
+    return version(tag) > version(latest)
+
+
 def check_names(names: list[str]) -> list[str]:
     require(names and len(set(names)) == len(names), "the asset list is empty or repeats a name")
     for name in names:
@@ -175,6 +197,9 @@ def main(argv=None) -> int:
     download.add_argument("--release-json", required=True, type=Path)
     download.add_argument("--github-output", required=True, type=Path)
     download.add_argument("--asset", action="append", required=True)
+    latest = commands.add_parser("make-latest")
+    latest.add_argument("--tag", required=True)
+    latest.add_argument("--latest", required=True)
     check = commands.add_parser("verify")
     check.add_argument("--dist", required=True, type=Path)
     check.add_argument("--tag", required=True)
@@ -187,6 +212,8 @@ def main(argv=None) -> int:
             print(len(tag_releases(args.repository, args.tag)))
         elif args.command == "fetch":
             fetch(args)
+        elif args.command == "make-latest":
+            print("true" if make_latest(args.tag, args.latest) else "false")
         else:
             release = json.load(sys.stdin)
             require(isinstance(release, dict), "the release JSON is not an object")

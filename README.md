@@ -117,7 +117,12 @@ builds a preview of the six programs and the unsigned manifest.
    `gh workflow run Release --ref vX.Y.Z -f publish_confirmation='publish vX.Y.Z'`
    and approve the `release` environment. It checks the draft against the
    digests the tag run recorded and the signature against the keys built
-   into the program, then publishes the release (immutable) as the latest.
+   into the program, then publishes the release (immutable). It becomes the
+   latest release (the one `aitp update` reads) only if its version is
+   higher than the current latest; publishing an older version leaves the
+   latest release as it is (the run's summary says so). Do not change the
+   draft while the publish run is running: it re-reads the draft right
+   before publishing, but cannot lock it.
 
 A failed tag run leaves no release or only a draft; delete the draft before
 building the tag again. A published release cannot be changed: fix a problem

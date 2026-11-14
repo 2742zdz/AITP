@@ -200,6 +200,18 @@ class GithubReleaseTest(unittest.TestCase):
         with self.assertRaisesRegex(github_release.CheckError, "expected"):
             self.verify(self.release(), names=["aitp-manifest.json"])
 
+    def test_make_latest_only_for_a_higher_version(self) -> None:
+        make_latest = github_release.make_latest
+        self.assertTrue(make_latest("v0.1.0", ""))
+        self.assertTrue(make_latest("v0.2.0", "v0.1.9"))
+        self.assertTrue(make_latest("v0.10.0", "v0.9.0"))  # numeric, not text order
+        self.assertTrue(make_latest("v1.0.0", "v0.99.99"))
+        self.assertFalse(make_latest("v0.1.1", "v0.2.0"))
+        self.assertFalse(make_latest("v0.9.0", "v0.10.0"))
+        for tag, latest in (("v1.2.3", "v1.2.3"), ("v1.2", "v1.0.0"), ("v1.2.3", "1.0.0"), ("v1.2.3", "v01.0.0")):
+            with self.assertRaises(github_release.CheckError, msg=f"{tag} {latest}"):
+                make_latest(tag, latest)
+
     def test_tag_run(self) -> None:
         sha = "a" * 40
         good = {"id": 5, "name": "Release", "path": ".github/workflows/release.yml", "event": "push",

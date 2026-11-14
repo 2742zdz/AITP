@@ -428,6 +428,11 @@ jobs:
     needs: gate
     if: needs.gate.outputs.mode == 'publish'
     environment: release
+    # One publish at a time across all tags (the latest release is shared);
+    # a running publish is never cancelled.
+    concurrency:
+      group: release-publish
+      cancel-in-progress: false
     runs-on: ubuntu-22.04
     timeout-minutes: 20
     permissions:
@@ -513,8 +518,28 @@ jobs:
           python3 -B scripts/github_release.py verify --dist dist --tag "$TAG" --state draft "${names[@]}" \
             < "$RUNNER_TEMP/before.json"
 
+          # The tag of the latest release; empty when there is none (404).
+          latest_tag() {
+            local output status=0
+            output="$(gh api "repos/$GITHUB_REPOSITORY/releases/latest" --jq .tag_name 2> "$RUNNER_TEMP/latest.err")" || status=$?
+            if [ "$status" = 0 ]; then
+              printf '%s\n' "$output"
+            elif grep -q "HTTP 404" "$RUNNER_TEMP/latest.err"; then
+              printf '\n'
+            else
+              cat "$RUNNER_TEMP/latest.err" >&2
+              return 1
+            fi
+          }
+          # Only a higher version becomes the latest release (updates read
+          # the latest release): an older version published later does not
+          # take it back.
+          previous="$(latest_tag)"
+          make_latest="$(python3 -B scripts/github_release.py make-latest --tag "$TAG" --latest "$previous")"
+          echo "latest release before: ${previous:-none}; $TAG becomes the latest: $make_latest"
+
           status=0
-          printf '%s' '{"draft":false,"prerelease":false,"make_latest":"true"}' |
+          printf '{"draft":false,"prerelease":false,"make_latest":"%s"}' "$make_latest" |
             gh api --method PATCH "$endpoint" --input - > /dev/null || status=$?
           echo "publish request status: $status"
           # Wait until GitHub reports it published; the checks below decide.
@@ -525,9 +550,20 @@ jobs:
           gh api "$endpoint" > "$RUNNER_TEMP/published.json"
           python3 -B scripts/github_release.py verify --dist dist --tag "$TAG" --state published "${names[@]}" \
             < "$RUNNER_TEMP/published.json"
-          latest="$(gh api "repos/$GITHUB_REPOSITORY/releases/latest" --jq .tag_name)"
-          if [ "$latest" != "$TAG" ]; then
-            echo "::error::$TAG is published, but the latest release is $latest (updates read the latest release)" >&2
+          latest="$(latest_tag)"
+          if [ "$make_latest" = true ]; then
+            expected="$TAG"
+          else
+            expected="$previous"
+          fi
+          if [ "$latest" != "$expected" ]; then
+            echo "::error::$TAG is published, but the latest release is '$latest', expected '$expected' (updates read the latest release)" >&2
             exit 1
           fi
-          echo "::notice::$TAG published (immutable) and is the latest release"
+          if [ "$make_latest" = true ]; then
+            echo "::notice::$TAG published (immutable) and is the latest release"
+            echo "$TAG published (immutable); it is the latest release." >> "$GITHUB_STEP_SUMMARY"
+          else
+            echo "::warning::$TAG published (immutable) but NOT made the latest release: $previous is a higher version"
+            echo "$TAG published (immutable); NOT the latest release ($previous is a higher version), so updates do not offer it." >> "$GITHUB_STEP_SUMMARY"
+          fi
