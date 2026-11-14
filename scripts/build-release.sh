@@ -9,9 +9,10 @@
 #   target dir   -> /aitp/target (build script outputs, generated sources)
 #
 # Rust code is remapped with `--remap-path-prefix`, C code built by
-# dependencies (ring, aws-lc) with `-ffile-prefix-map` (GCC 8+, Clang 10+;
-# not for MSVC, whose compiler has no such option: there the release check
-# alone shows that no path is left).
+# dependencies (ring, aws-lc) with `-ffile-prefix-map` (GCC 8+, Clang 10+).
+# MSVC has no prefix map: its compiler gets `/d1trimfile:<directory>\`
+# instead, which cuts the directory off __FILE__ (AWS-LC's assertions carry
+# their source paths, narrow and wide), leaving a relative path.
 #
 # Release targets (one per run):
 #
@@ -56,11 +57,8 @@ fail() {
   exit 1
 }
 
-# Only Linux GNU targets are verified: CARGO_ENCODED_RUSTFLAGS replaces the
-# rustflags of Cargo configuration files (the repository sets
-# `link-arg=/Brepro` for Windows MSVC), and other platforms embed paths
-# differently. The target comes from --target, else CARGO_BUILD_TARGET, else
-# the host; it is then passed to Cargo explicitly.
+# The target comes from --target, else CARGO_BUILD_TARGET, else the host;
+# it is then passed to Cargo explicitly.
 targets=()
 cargo_arguments=()
 previous=""
@@ -199,8 +197,13 @@ c_flags=""
 while IFS=$'\t' read -r _ from to; do
   [[ -n "$from" ]] || continue
   rust_flags+=("--remap-path-prefix=$from=$to")
-  # MSVC's compiler has no prefix map (and would only warn about the option).
-  [[ "$kind" == windows ]] || c_flags+=" -ffile-prefix-map=$from=$to"
+  if [[ "$kind" == windows ]]; then
+    # The compiler sees C:\..., in its own spelling.
+    windows_from="$(cygpath -w "$from")"
+    c_flags+=" /d1trimfile:$windows_from\\"
+  else
+    c_flags+=" -ffile-prefix-map=$from=$to"
+  fi
 done <<<"$ordered"
 [[ ${#rust_flags[@]} -gt 0 ]] || fail "no directory to remap"
 # Configuration-file rustflags no longer apply (see above): the Windows
