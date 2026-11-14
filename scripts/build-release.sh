@@ -209,7 +209,7 @@ while IFS=$'\t' read -r _ from to; do
     windows_from="$(cygpath -w "$from")"
     c_flags+=" /d1trimfile:$windows_from\\"
   elif [[ "$triple" == aarch64-pc-windows-msvc ]]; then
-    # Clang (ring and AWS-LC need it for this target), C:\... spelling.
+    # Clang (ring builds its C code with it for this target), C:\... spelling.
     windows_from="$(cygpath -w "$from")"
     c_flags+=" -ffile-prefix-map=$windows_from=$to"
   else
