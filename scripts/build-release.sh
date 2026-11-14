@@ -10,9 +10,11 @@
 #
 # Rust code is remapped with `--remap-path-prefix`, C code built by
 # dependencies (ring, aws-lc) with `-ffile-prefix-map` (GCC 8+, Clang 10+).
-# MSVC has no prefix map: its compiler gets `/d1trimfile:<directory>\`
-# instead, which cuts the directory off __FILE__ (AWS-LC's assertions carry
-# their source paths, narrow and wide), leaving a relative path.
+# For x86_64 Windows the C code is built by MSVC, which has no prefix map:
+# its compiler gets `/d1trimfile:<directory>\` instead, which cuts the
+# directory off __FILE__, leaving a relative path (AWS-LC's assertions carry
+# __FILE__, also widened; check_release.py checks both forms in the result).
+# For arm64 Windows ring builds its C code with Clang (-ffile-prefix-map).
 #
 # Release targets (one per run):
 #
@@ -112,6 +114,11 @@ case "$kind" in
   windows) $windows_host || fail "$triple builds on Windows only" ;;
   macos) [[ "$(uname -s)" == Darwin ]] || fail "$triple builds on macOS only" ;;
 esac
+# The MSVC flags below hold backslashes, which the cc crate's shell-escaped
+# mode would read as escapes.
+if [[ "$kind" == windows && -n "${CC_SHELL_ESCAPED_FLAGS:-}" ]]; then
+  fail "CC_SHELL_ESCAPED_FLAGS is not supported for Windows release builds"
+fi
 if env | grep -E '^(C|CXX)FLAGS_[^=]*-' >/dev/null; then
   fail "C flag variables named with a dash cannot be extended; use the underscore form"
 fi
@@ -197,10 +204,14 @@ c_flags=""
 while IFS=$'\t' read -r _ from to; do
   [[ -n "$from" ]] || continue
   rust_flags+=("--remap-path-prefix=$from=$to")
-  if [[ "$kind" == windows ]]; then
-    # The compiler sees C:\..., in its own spelling.
+  if [[ "$triple" == x86_64-pc-windows-msvc ]]; then
+    # MSVC (cl); the compiler sees C:\..., in its own spelling.
     windows_from="$(cygpath -w "$from")"
     c_flags+=" /d1trimfile:$windows_from\\"
+  elif [[ "$triple" == aarch64-pc-windows-msvc ]]; then
+    # Clang (ring and AWS-LC need it for this target), C:\... spelling.
+    windows_from="$(cygpath -w "$from")"
+    c_flags+=" -ffile-prefix-map=$windows_from=$to"
   else
     c_flags+=" -ffile-prefix-map=$from=$to"
   fi

@@ -128,8 +128,13 @@ class CheckReleaseTest(unittest.TestCase):
         for encoding in ("utf-8", "utf-16-le"):
             data = b"x" + "d:/a/aitp/AITP\\src\\foo.c".encode(encoding) + b"y"
             self.assertTrue(check_release.carries_path(check_release.path_view(data), path), encoding)
-        neutral = b"/aitp/src/foo.c\0" + "/aitp/src".encode("utf-16-le")
-        self.assertFalse(check_release.carries_path(check_release.path_view(neutral), "/home/runner/work/AITP/AITP"))
+        neutral = b"/aitp/src/foo.c\0" + "/aitp/src/foo.c".encode("utf-16-le") + b"\0\0"
+        for path in ("/home/runner/work/AITP/AITP", "/src"):
+            self.assertFalse(check_release.carries_path(check_release.path_view(neutral), path), path)
+        # A short build path outside a neutral prefix is still found.
+        for encoding in ("utf-8", "utf-16-le"):
+            data = "/src/foo.c".encode(encoding)
+            self.assertTrue(check_release.carries_path(check_release.path_view(data), "/src"), encoding)
 
 
 class GithubReleaseTest(unittest.TestCase):

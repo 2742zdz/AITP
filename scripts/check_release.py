@@ -147,15 +147,17 @@ def build_machine_paths(build_dirs: list[Path], environ=os.environ) -> list[str]
     return paths
 
 
-def names_path(view: bytes, path: str) -> bool:
-    """Whether `view` holds `path` anywhere outside a whole neutral prefix
-    (`/src` inside `/aitp/src/...` is the prefix itself, not a build path)."""
+def names_path(view: bytes, path: str, encoding: str = "utf-8") -> bool:
+    """Whether `view` holds `path` (in `encoding`) anywhere outside a whole
+    neutral prefix in the same encoding (`/src` inside `/aitp/src/...` is
+    the prefix itself, not a build path)."""
+    end_mark = NEUTRAL_PREFIX_END if encoding == "utf-8" else rb"(?=/\x00|\x00\x00|\Z)"
     neutral = {
         (match.start(), match.end())
         for prefix in NEUTRAL_PREFIXES
-        for match in re.finditer(re.escape(prefix.encode()) + NEUTRAL_PREFIX_END, view)
+        for match in re.finditer(re.escape(prefix.encode(encoding)) + end_mark, view)
     }
-    needle = path_view(path.encode())
+    needle = path_view(path.encode(encoding))
     start = view.find(needle)
     while start >= 0:
         end = start + len(needle)
@@ -166,10 +168,10 @@ def names_path(view: bytes, path: str) -> bool:
 
 
 def carries_path(view: bytes, path: str) -> bool:
-    """Whether `view` (path_view of a program) names `path` as UTF-8 text
-    outside the neutral prefixes, or anywhere as UTF-16LE text (wide strings
-    of Windows C code, e.g. __FILEW__; nothing remaps those)."""
-    return names_path(view, path) or path_view(path.encode("utf-16-le")) in view
+    """Whether `view` (path_view of a program) names `path` outside the
+    neutral prefixes, as UTF-8 or as UTF-16LE text (wide strings of Windows
+    C code, such as a widened __FILE__)."""
+    return names_path(view, path) or names_path(view, path, "utf-16-le")
 
 
 def path_context(data: bytes, paths: list[str], limit: int = 5) -> str:
