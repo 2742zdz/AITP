@@ -98,9 +98,15 @@ def fetch(args) -> None:
     require(SHA.fullmatch(args.sha) is not None, "the commit is not a full SHA")
     require(not args.dist.exists(), f"{args.dist} already exists")
     names = check_names(args.asset)
-    runs = json.loads(gh(f"repos/{args.repository}/actions/workflows/{Path(WORKFLOW_PATH).name}/runs"
-                         f"?event=push&head_sha={args.sha}&per_page=100"))
-    run = tag_run(runs.get("workflow_runs") if isinstance(runs, dict) else None, args.tag, args.sha)
+    pages = json.loads(gh("--paginate", "--slurp",
+                          f"repos/{args.repository}/actions/workflows/{Path(WORKFLOW_PATH).name}/runs"
+                          f"?event=push&head_sha={args.sha}&per_page=100"))
+    require(isinstance(pages, list) and all(isinstance(page, dict) for page in pages), "unexpected run pages")
+    runs = []
+    for page in pages:
+        require(isinstance(page.get("workflow_runs"), list), "unexpected run page")
+        runs.extend(page["workflow_runs"])
+    run = tag_run(runs, args.tag, args.sha)
     releases = tag_releases(args.repository, args.tag)
     require(len(releases) == 1, f"expected exactly one release of {args.tag}, found {len(releases)}")
     release = releases[0]

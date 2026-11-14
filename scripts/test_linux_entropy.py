@@ -40,6 +40,14 @@ import time
 from pathlib import Path
 
 TIMEOUT = 60.0
+# Exit status when the program itself fails under the filter (initialization
+# fails, or the proxy dies or breaks the handshake); anything else that goes
+# wrong exits 1. The workflow's control build must fail with exactly this.
+PROGRAM_FAILED = 3
+
+
+class ProgramFailure(Exception):
+    pass
 TLS_HOST = "api.anthropic.com"
 
 
@@ -100,7 +108,8 @@ def run(binary: Path, args: list[str], env: dict[str, str]) -> str:
         preexec_fn=deny_getrandom,
     )
     if result.returncode != 0:
-        raise AssertionError(f"aitp {args[0]} failed ({result.returncode}):\n{result.stdout}\n{result.stderr}")
+        failure = ProgramFailure if args[0] != "--version" else AssertionError
+        raise failure(f"aitp {args[0]} failed ({result.returncode}):\n{result.stdout}\n{result.stderr}")
     return result.stdout
 
 
@@ -167,9 +176,15 @@ def main() -> int:
             preexec_fn=deny_getrandom,
         )
         try:
-            session = handshake(port, ca)
+            try:
+                session = handshake(port, ca)
+            except (OSError, AssertionError) as error:
+                time.sleep(1)
+                if proxy.poll() is not None:
+                    raise ProgramFailure(f"the local proxy exited ({proxy.returncode}): {error}") from error
+                raise
             if proxy.poll() is not None:
-                raise AssertionError(f"the local proxy exited ({proxy.returncode})")
+                raise ProgramFailure(f"the local proxy exited ({proxy.returncode})")
         except BaseException:
             proxy.kill()
             proxy.wait(timeout=10)
@@ -184,4 +199,8 @@ def main() -> int:
 
 
 if __name__ == "__main__":
-    raise SystemExit(main())
+    try:
+        raise SystemExit(main())
+    except ProgramFailure as failure:
+        print(f"test_linux_entropy.py: the program failed with getrandom failing: {failure}", file=sys.stderr)
+        raise SystemExit(PROGRAM_FAILED) from failure

@@ -23,6 +23,7 @@ def load(name: str):
 
 
 check_asset = load("check_asset")
+check_release = load("check_release")
 github_release = load("github_release")
 
 
@@ -46,7 +47,8 @@ def elf(machine: int = 62, interpreter: bool = False, needed: bool = False, extr
 
 
 def macho(cpu: int = 0x0100000C, file_type: int = 2) -> bytes:
-    return struct.pack("<IiiIIII", 0xFEEDFACF, cpu, 0, file_type, 0, 0, 0) + bytes(64)
+    command = struct.pack("<II", 0x19, 72) + bytes(64)  # one LC_SEGMENT_64-sized command
+    return struct.pack("<IiiIIIII", 0xFEEDFACF, cpu, 0, file_type, 1, len(command), 0, 0) + command
 
 
 def pe(machine: int = 0x8664, repro: bool = True, pdb: bytes = b"aitp.pdb", debug: bool = True) -> bytes:
@@ -95,6 +97,7 @@ class CheckAssetTest(unittest.TestCase):
         self.refuses("aitp-linux-x86_64", elf(needed=True), "shared library")
         self.refuses("aitp-linux-x86_64", elf(extra=b"memcpy@GLIBC_2.14"), "GNU C library")
         self.refuses("aitp-linux-x86_64", macho(), "not an ELF")
+        self.refuses("aitp-linux-x86_64", elf()[:0x320], "loadable segment")
 
     def test_macos(self) -> None:
         self.assertEqual(self.check("aitp-macos-aarch64", macho()), "Mach-O executable")
@@ -102,6 +105,8 @@ class CheckAssetTest(unittest.TestCase):
         self.refuses("aitp-macos-x86_64", macho(), "CPU type")
         self.refuses("aitp-macos-aarch64", macho(file_type=6), "not a Mach-O executable")
         self.refuses("aitp-macos-aarch64", elf(), "Mach-O")
+        self.refuses("aitp-macos-aarch64", macho()[:28], "truncated|Mach-O")
+        self.refuses("aitp-macos-aarch64", macho()[:60], "load commands")
 
     def test_windows(self) -> None:
         self.assertIn("/Brepro", self.check("aitp-windows-x86_64.exe", pe()))
@@ -115,6 +120,16 @@ class CheckAssetTest(unittest.TestCase):
     def test_names(self) -> None:
         self.refuses("aitp-linux-riscv64", elf(), "not a release asset name")
         self.refuses("aitp-windows-x86_64", pe(), "not a release asset name")
+
+
+class CheckReleaseTest(unittest.TestCase):
+    def test_build_paths_in_utf8_and_utf16(self) -> None:
+        path = "D:\\a\\AITP\\AITP"
+        for encoding in ("utf-8", "utf-16-le"):
+            data = b"x" + "d:/a/aitp/AITP\\src\\foo.c".encode(encoding) + b"y"
+            self.assertTrue(check_release.carries_path(check_release.path_view(data), path), encoding)
+        neutral = b"/aitp/src/foo.c\0" + "/aitp/src".encode("utf-16-le")
+        self.assertFalse(check_release.carries_path(check_release.path_view(neutral), "/home/runner/work/AITP/AITP"))
 
 
 class GithubReleaseTest(unittest.TestCase):

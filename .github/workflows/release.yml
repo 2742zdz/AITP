@@ -53,6 +53,9 @@ jobs:
     name: Release gate
     runs-on: ubuntu-22.04
     timeout-minutes: 5
+    permissions:
+      contents: read
+      actions: read
     outputs:
       mode: ${{ steps.mode.outputs.mode }}
     steps:
@@ -93,8 +96,10 @@ jobs:
           esac
           # No release-gate bypass anywhere in the repository (the name is
           # split here so that this check does not find itself).
-          if git grep -n "ALLOW_PLACEHOLDER""_SIGNING_KEY" -- .; then
-            echo "::error::a placeholder signing key switch is named in the repository" >&2
+          found=0
+          git grep -n "ALLOW_PLACEHOLDER""_SIGNING_KEY" -- . || found=$?
+          if [ "$found" != 1 ]; then
+            echo "::error::a placeholder signing key switch is named in the repository (git grep: $found)" >&2
             exit 1
           fi
           if [ "$mode" != preview ]; then
@@ -102,6 +107,16 @@ jobs:
             if [ "$REF_NAME" != "v$version" ]; then
               echo "::error::tag $REF_NAME does not name the package version $version (expected v$version)" >&2
               exit 1
+            fi
+            # A job that names an environment which does not exist creates
+            # it unprotected: publishing needs "release" with a reviewer.
+            if [ "$mode" = publish ]; then
+              reviewers="$(gh api "repos/$GITHUB_REPOSITORY/environments/release" \
+                --jq '[.protection_rules[]? | select(.type == "required_reviewers") | .reviewers[]?] | length')"
+              if ! [ "$reviewers" -ge 1 ] 2>/dev/null; then
+                echo "::error::environment 'release' has no required reviewer (found: '$reviewers')" >&2
+                exit 1
+              fi
             fi
             # The release tag points into main (tags are protected, main is
             # never rewritten).
@@ -221,13 +236,17 @@ jobs:
           TARGET: ${{ matrix.target }}
         run: |
           cargo build --locked --release --bin aitp --target "$TARGET"
-          if python3 -B scripts/test_linux_entropy.py --binary "$CARGO_TARGET_DIR/$TARGET/release/aitp" \
-              > "$RUNNER_TEMP/control.log" 2>&1; then
-            cat "$RUNNER_TEMP/control.log"
-            echo "::error::a musl build without the kernel headers passed the entropy check" >&2
+          status=0
+          python3 -B scripts/test_linux_entropy.py --binary "$CARGO_TARGET_DIR/$TARGET/release/aitp" \
+            > "$RUNNER_TEMP/control.log" 2>&1 || status=$?
+          tail -n 30 "$RUNNER_TEMP/control.log"
+          # 3: the program itself failed (not the check's own setup).
+          if [ "$status" != 3 ]; then
+            echo "::error::the entropy check of a musl build without the kernel headers exited $status, expected 3" >&2
             exit 1
           fi
-          tail -n 20 "$RUNNER_TEMP/control.log"
+          # AWS-LC's own message when musl's getentropy() fails.
+          grep -F "getentropy failed" "$RUNNER_TEMP/control.log"
 
       - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
         with:

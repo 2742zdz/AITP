@@ -118,7 +118,8 @@ if env | grep -E '^(C|CXX)FLAGS_[^=]*-' >/dev/null; then
   fail "C flag variables named with a dash cannot be extended; use the underscore form"
 fi
 
-kernel="$(native_path "$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)")"
+kernel="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
+kernel="$(native_path "$kernel")"
 manifest="$kernel/Cargo.toml"
 # (Windows: python3 may be the store stub; the runner's Python is python.)
 python="${PYTHON:-python3}"
@@ -142,7 +143,8 @@ workspace="$(dirname "$workspace_manifest")"
 
 target_dir="${CARGO_TARGET_DIR:-$workspace/target}"
 mkdir -p "$target_dir"
-target_dir="$(native_path "$(cd "$target_dir" && pwd)")"
+target_dir="$(cd "$target_dir" && pwd)"
+target_dir="$(native_path "$target_dir")"
 export CARGO_TARGET_DIR="$target_dir"
 
 home="${HOME:-}"
@@ -152,7 +154,10 @@ if $windows_host; then
   # On Windows the tools see the user profile, not Git Bash's HOME.
   home="${USERPROFILE:-$home}"
   for name in home cargo_home rustup_home; do
-    [[ -z "${!name}" ]] || printf -v "$name" '%s' "$(cygpath -m "${!name}")"
+    if [[ -n "${!name}" ]]; then
+      converted="$(cygpath -m "${!name}")"
+      printf -v "$name" '%s' "$converted"
+    fi
   done
 fi
 
@@ -205,15 +210,17 @@ if [[ "$kind" == windows ]]; then
 fi
 
 # musl: the kernel headers, by themselves, in a directory inside the target
-# directory (remapped like it). Exported first, so the C flags below are
-# added to this variable too.
+# directory (remapped like it; a fixed name per target, so the flags and any
+# path the C code records do not vary between builds; removed afterwards).
+# Exported first, so the C flags below are added to this variable too.
 if [[ "$kind" == linux-musl ]]; then
   suffix="${triple//-/_}"
   cc_variable="CC_$suffix"
   cflags_variable="CFLAGS_$suffix"
   export "$cc_variable=${!cc_variable:-${CC:-musl-gcc}}"
-  uapi_dir="$target_dir/aitp-linux-uapi"
+  uapi_dir="$target_dir/aitp-linux-uapi-$triple"
   rm -rf "$uapi_dir"
+  trap 'rm -rf "$uapi_dir"' EXIT
   mkdir -p "$uapi_dir"
   multiarch="$(gcc -print-multiarch)"
   for name in linux asm-generic; do

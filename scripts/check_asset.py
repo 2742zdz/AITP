@@ -68,6 +68,9 @@ def check_elf(data: bytes, machine: int) -> str:
         require(kind != PT_INTERP, "the program asks for a dynamic loader (PT_INTERP)")
         headers.append((kind, flags, offset, address, file_size, memory_size))
     loads = [header for header in headers if header[0] == PT_LOAD]
+    for _kind, _flags, offset, _address, file_size, memory_size in loads:
+        window(data, offset, file_size, "a loadable segment")
+        require(file_size <= memory_size, "a loadable segment is larger in the file than in memory")
     require(any(flags & PF_X and address <= entry < address + file_size
                 for _, flags, _, address, file_size, _ in loads), "the entry point is in no executable segment")
     for kind, _flags, offset, _address, file_size, _memory_size in headers:
@@ -87,16 +90,24 @@ def check_elf(data: bytes, machine: int) -> str:
 
 # --- macOS ------------------------------------------------------------------
 
-MACH_HEADER = struct.Struct("<IiiIIII")
+MACH_HEADER = struct.Struct("<IiiIIIII")
 MH_MAGIC_64, MH_EXECUTE = 0xFEEDFACF, 2
 
 
 def check_macho(data: bytes, cpu: int) -> str:
     require(len(data) >= MACH_HEADER.size, "not a Mach-O file")
-    magic, cpu_type, _subtype, file_type, _count, _size, _flags = MACH_HEADER.unpack_from(data)
+    magic, cpu_type, _subtype, file_type, count, size, _flags, _reserved = MACH_HEADER.unpack_from(data)
     require(magic == MH_MAGIC_64, "not a 64-bit little-endian Mach-O file (or a universal one)")
     require(cpu_type == cpu, f"Mach-O CPU type {cpu_type:#x}, expected {cpu:#x}")
     require(file_type == MH_EXECUTE, "not a Mach-O executable")
+    commands = window(data, MACH_HEADER.size, size, "the load commands")
+    position = 0
+    for _ in range(count):
+        require(position + 8 <= len(commands), "the load commands are truncated")
+        _command, command_size = struct.unpack_from("<II", commands, position)
+        require(command_size >= 8 and position + command_size <= len(commands), "a load command is truncated")
+        position += command_size
+    require(count > 0, "no load commands")
     return "Mach-O executable"
 
 
