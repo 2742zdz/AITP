@@ -1,0 +1,204 @@
+name: CI
+
+on:
+  pull_request:
+    branches: [main]
+  push:
+    branches: [main]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+# Every run block under bash -eo pipefail (also on Windows).
+defaults:
+  run:
+    shell: bash
+
+concurrency:
+  group: ci-${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  linux:
+    name: Linux (format, lint, test, release build)
+    runs-on: ubuntu-22.04
+    timeout-minutes: 45
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      - uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97 # v7.0.0
+        with:
+          python-version: '3.12'
+
+      - uses: dtolnay/rust-toolchain@4be7066ada62dd38de10e7b70166bc74ed198c30
+        with:
+          toolchain: '1.97.0'
+          components: clippy, rustfmt
+
+      - uses: Swatinem/rust-cache@42dc69e1aa15d09112580998cf2ef0119e2e91ae # v2
+        with:
+          save-if: ${{ github.ref == 'refs/heads/main' }}
+
+      - name: Format
+        run: cargo fmt --all --check
+
+      # With and without the contract entries (test entry points for a
+      # distribution's contract tests; never enabled for a release build).
+      - name: Lint
+        run: |
+          cargo clippy --locked --all-targets -- -D warnings
+          cargo clippy --locked --all-targets --features contract -- -D warnings
+
+      - name: Test
+        run: cargo test --locked
+
+      # The AITP brand installs and renders its services (contract entries).
+      - name: Test the aitp program with the contract entries
+        run: cargo test --locked --features contract --bin aitp
+
+      - name: Test the release manifest tool and the VSCode certificate helper
+        run: |
+          python3 scripts/test_release_manifest.py
+          node --test scripts/test_vscode_certificates.js
+
+      # The release build (paths remapped, as published) runs, carries the
+      # brand data and the real update signing keys, and names no build path.
+      - name: Build and check the release program
+        env:
+          CARGO_BUILD_JOBS: 2
+        run: |
+          aitp="$(bash scripts/build-release.sh --locked)"
+          "$aitp" --version
+          "$aitp" --help > /dev/null
+          python3 scripts/check_release.py --build-dir "$GITHUB_WORKSPACE" "$aitp"
+          echo "AITP_PROGRAM=$aitp" >> "$GITHUB_ENV"
+
+      # The build and the check refuse placeholder keys: a copy whose brand
+      # carries the placeholders does not build, and a program that carries
+      # one fails the check.
+      - name: Control - placeholder signing keys are refused
+        run: |
+          copy="$RUNNER_TEMP/placeholder-copy"
+          mkdir "$copy"
+          git archive --format=tar HEAD | tar -x -C "$copy"
+          python3 - "$copy" <<'PY'
+          import importlib.util, pathlib, sys
+          sys.dont_write_bytecode = True
+          copy = pathlib.Path(sys.argv[1])
+          spec = importlib.util.spec_from_file_location("rm", copy / "scripts/release_manifest.py")
+          rm = importlib.util.module_from_spec(spec)
+          spec.loader.exec_module(rm)
+          brand = copy / "src/bin/aitp/brand.rs"
+          text = brand.read_text(encoding="utf-8")
+          keys = rm.brand_keys(text)
+          assert len(keys) == len(rm.PLACEHOLDER_KEYS), keys
+          for key, placeholder in zip(keys, rm.PLACEHOLDER_KEYS):
+              assert text.count(key) >= 1, key
+              text = text.replace(key, placeholder)
+          brand.write_text(text, encoding="utf-8")
+          PY
+          if bash "$copy/scripts/build-release.sh" --locked 2> "$RUNNER_TEMP/build.log"; then
+            echo "::error::the release build accepted placeholder signing keys"
+            exit 1
+          fi
+          grep "update signing keys are placeholders" "$RUNNER_TEMP/build.log"
+          cp "$AITP_PROGRAM" "$RUNNER_TEMP/aitp-placeholder"
+          printf '%s' RWQAITPxPRIMARYxPLACEHOLDERxKEYxNOTxFORxRELEASE222222222 >> "$RUNNER_TEMP/aitp-placeholder"
+          if python3 scripts/check_release.py --build-dir "$GITHUB_WORKSPACE" \
+              "$RUNNER_TEMP/aitp-placeholder" 2> "$RUNNER_TEMP/keys.log"; then
+            echo "::error::the release check accepted placeholder signing keys"
+            exit 1
+          fi
+          grep "carries placeholder signing keys" "$RUNNER_TEMP/keys.log"
+
+      # An ordinary release build (paths not remapped) is caught by the check.
+      - name: Control - an ordinary release build fails the check
+        env:
+          CARGO_BUILD_JOBS: 2
+          CARGO_TARGET_DIR: ${{ runner.temp }}/aitp-plain
+        run: |
+          cargo build --locked --release --bin aitp
+          if python3 scripts/check_release.py --build-dir "$GITHUB_WORKSPACE" \
+              "$CARGO_TARGET_DIR/release/aitp" 2> "$RUNNER_TEMP/control.log"; then
+            echo "::error::the check accepted an ordinary release build"
+            exit 1
+          fi
+          cat "$RUNNER_TEMP/control.log"
+          grep "carries build machine paths" "$RUNNER_TEMP/control.log"
+
+  macos:
+    name: macOS (${{ matrix.arch }})
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 35
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - os: macos-15-intel
+            arch: x86_64
+          - os: macos-15
+            arch: arm64
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      - uses: dtolnay/rust-toolchain@4be7066ada62dd38de10e7b70166bc74ed198c30
+        with:
+          toolchain: '1.97.0'
+
+      - uses: Swatinem/rust-cache@42dc69e1aa15d09112580998cf2ef0119e2e91ae # v2
+        with:
+          save-if: ${{ github.ref == 'refs/heads/main' }}
+
+      # Platform-specific renderings (LaunchAgent plist) run through the
+      # contract entries on this platform.
+      - name: Test
+        run: |
+          node --test scripts/test_vscode_certificates.js
+          cargo test --locked
+          cargo test --locked --features contract --bin aitp
+
+  windows:
+    name: Windows
+    runs-on: windows-latest
+    timeout-minutes: 35
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      - uses: dtolnay/rust-toolchain@4be7066ada62dd38de10e7b70166bc74ed198c30
+        with:
+          toolchain: '1.97.0'
+
+      - uses: Swatinem/rust-cache@42dc69e1aa15d09112580998cf2ef0119e2e91ae # v2
+        with:
+          save-if: ${{ github.ref == 'refs/heads/main' }}
+
+      # The native Desktop runtime tests one at a time; fails unless at least
+      # one test matched (a filter that matches nothing passes vacuously).
+      - name: Test the native Windows Desktop runtime
+        shell: bash
+        run: |
+          log="$RUNNER_TEMP/desktop-runtime.log"
+          cargo test --locked --lib windows_desktop_runtime::tests -- --test-threads=1 2>&1 | tee "$log"
+          test "${PIPESTATUS[0]}" -eq 0
+          ran="$(grep -Eo '^test result: ok\. [0-9]+ passed' "$log" | awk '{sum += $4} END {print sum + 0}')"
+          if [ "$ran" -eq 0 ]; then
+            echo "::error::no windows_desktop_runtime test ran"
+            exit 1
+          fi
+          echo "$ran windows_desktop_runtime test(s) passed"
+
+      # Platform-specific renderings (Windows update helper) run through the
+      # contract entries on this platform.
+      - name: Test
+        shell: bash
+        run: |
+          node --test scripts/test_vscode_certificates.js
+          cargo test --locked
+          cargo test --locked --features contract --bin aitp
