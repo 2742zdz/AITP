@@ -19,8 +19,9 @@ the only one the program accepts:
                              [--artifact PROGRAM ...]
       Before upload: the signature verifies with a key the AITP program
       trusts (never a placeholder), the manifest names this distribution,
-      the package version and exactly the release assets in DIR with their
-      size and SHA-256, and each of those assets (and every --artifact)
+      the package version and exactly the release assets in DIR (the six
+      programs and the installers setup.sh and setup.ps1) with their size
+      and SHA-256, and each of those programs (and every --artifact)
       carries the trusted keys and no placeholder.
 
   release_manifest.py keys [--require-real]
@@ -55,7 +56,8 @@ MANIFEST_LIMIT = 1024 * 1024
 MANIFEST_SCHEMA = 1
 ASSET_MIN = 1024 * 1024
 ASSET_MAX = 64 * 1024 * 1024
-ASSETS = (
+# The programs, one per platform: what `aitp update` installs.
+PROGRAMS = (
     "aitp-linux-x86_64",
     "aitp-linux-aarch64",
     "aitp-macos-x86_64",
@@ -63,6 +65,13 @@ ASSETS = (
     "aitp-windows-x86_64.exe",
     "aitp-windows-aarch64.exe",
 )
+# The installers (scripts/), listed so that a mirror of the release can
+# check them too. They are no programs: their own size range, and they
+# carry no signing keys.
+SCRIPTS = ("setup.sh", "setup.ps1")
+SCRIPT_MIN = 1
+SCRIPT_MAX = 1024 * 1024
+ASSETS = PROGRAMS + SCRIPTS
 
 # The placeholder keys the brand carries until the maintainer's real keys
 # are filled in. They are well-formed minisign key lines whose key bytes are
@@ -314,9 +323,10 @@ def parse_manifest(data: bytes, distribution: str) -> dict:
             f"manifest asset {name} has invalid sha256 {info['sha256']!r}",
         )
         size = info.get("size")
+        low, high = (SCRIPT_MIN, SCRIPT_MAX) if name in SCRIPTS else (ASSET_MIN, ASSET_MAX)
         require(
-            _is_integer(size) and ASSET_MIN <= size <= ASSET_MAX,
-            f"manifest asset {name} has no size between {ASSET_MIN} and {ASSET_MAX} bytes",
+            _is_integer(size) and low <= size <= high,
+            f"manifest asset {name} has no size between {low} and {high} bytes",
         )
     return manifest
 
@@ -485,8 +495,9 @@ def verify_release(manifest_path: Path, signature_path: Path, dist: Path, artifa
                    version: str | None = None, assets: tuple[str, ...] = ASSETS, keys: list[str] | None = None,
                    distribution: str | None = None) -> str:
     """All pre-upload checks; returns the signing key id. The release assets
-    in `dist` (exactly the manifest's, by size and SHA-256) must each carry
-    the trusted keys; `artifacts` are further programs checked the same way."""
+    in `dist` are exactly the manifest's, by size and SHA-256; each program
+    among them (not the installer scripts) must carry the trusted keys;
+    `artifacts` are further programs checked the same way."""
     keys = brand_keys() if keys is None else keys
     distribution = brand_distribution() if distribution is None else distribution
     require_real_keys(keys)
@@ -502,7 +513,8 @@ def verify_release(manifest_path: Path, signature_path: Path, dist: Path, artifa
     )
     for name in assets:
         require(file_metadata(dist / name) == manifest["assets"][name], f"{dist / name} does not match the manifest")
-        require_program_keys(dist / name, keys)
+        if name not in SCRIPTS:
+            require_program_keys(dist / name, keys)
     for artifact in artifacts:
         require(artifact.is_file(), f"program is missing: {artifact}")
         require_program_keys(artifact, keys)

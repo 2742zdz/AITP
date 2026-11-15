@@ -213,6 +213,11 @@ class ManifestTests(unittest.TestCase):
 
     def test_rules_match_the_program(self):
         rm.parse_manifest(self.good(), "aitp")
+        rm.parse_manifest(self.good(assets={
+            "aitp-linux-x86_64": {"sha256": "a" * 64, "size": 2 * 1024 * 1024},
+            "setup.sh": {"sha256": "b" * 64, "size": 1},
+            "setup.ps1": {"sha256": "c" * 64, "size": 1024 * 1024},
+        }), "aitp")
         asset = '{"sha256":"' + "a" * 64 + '","size":2097152}'
         for text, expected in [
             (self.good(distribution="other"), "not 'aitp'"),
@@ -232,6 +237,10 @@ class ManifestTests(unittest.TestCase):
             (self.good().replace(b'"version"', b'"version": "1.2.4", "vers\\u0069on"'), "repeats the field 'version'"),
             (('{"manifest_schema":1,"distribution":"aitp","version":"1.2.3","assets":{"a":' + asset + ',"a":' + asset + "}}").encode(), "repeats the field 'a'"),
             (b"\xef\xbb\xbf" + self.good(), "not JSON"),
+            # Installers have their own size range; programs keep theirs.
+            (self.good(assets={"setup.sh": {"sha256": "a" * 64, "size": 0}}), "no size between 1 and"),
+            (self.good(assets={"setup.ps1": {"sha256": "a" * 64, "size": 1024 * 1024 + 1}}), "no size between 1 and"),
+            (self.good(assets={"aitp-linux-x86_64": {"sha256": "a" * 64, "size": 20000}}), "no size between 1048576"),
         ]:
             with self.assertRaisesRegex(rm.CheckError, expected, msg=text):
                 rm.parse_manifest(text, "aitp")
@@ -258,8 +267,10 @@ class PrintedCommandTests(unittest.TestCase):
     def test_generate_refuses_an_unsafe_output_name(self):
         with tempfile.TemporaryDirectory() as temporary:
             dist = Path(temporary)
-            for index, name in enumerate(rm.ASSETS):
+            for index, name in enumerate(rm.PROGRAMS):
                 (dist / name).write_bytes(bytes([index]) * (1024 * 1024))
+            for name in rm.SCRIPTS:
+                (dist / name).write_bytes(b"# installer\n")
             for name in ["release manifest.json", "a'b.json", "$(touch x).json", "a;b.json"]:
                 result = subprocess.run(
                     [sys.executable, "-I", "-B", str(HERE / "release_manifest.py"), "generate",
@@ -311,8 +322,11 @@ class BrandAndReleaseTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as temporary:
             dist = Path(temporary)
             carried = b"\0".join(key.encode() for key in keys)
-            for index, name in enumerate(rm.ASSETS):
+            for index, name in enumerate(rm.PROGRAMS):
                 (dist / name).write_bytes(carried + bytes([index]) * (1024 * 1024 + index))
+            # The installers carry no keys, and need none.
+            for name in rm.SCRIPTS:
+                (dist / name).write_bytes(f"# {name}\n".encode())
             result = subprocess.run(
                 [sys.executable, "-I", str(HERE / "release_manifest.py"), "generate", "--dist", str(dist), "--version", "1.2.3"],
                 capture_output=True, text=True, check=True,
@@ -326,6 +340,7 @@ class BrandAndReleaseTests(unittest.TestCase):
                 result.stdout,
             )
             self.assertEqual(json.loads(manifest)["distribution"], "aitp")
+            self.assertEqual(sorted(json.loads(manifest)["assets"]), sorted(rm.PROGRAMS + rm.SCRIPTS))
             self.assertTrue(manifest.endswith(b"}\n"))
             signature_path = dist / (rm.MANIFEST_NAME + rm.SIGNATURE_SUFFIX)
             signature_path.write_bytes(primary.sign(manifest))
@@ -343,11 +358,18 @@ class BrandAndReleaseTests(unittest.TestCase):
             self.assertEqual(check(), rm.key_id_text(primary.key_id))
             signature_path.write_bytes(recovery.sign(manifest))
             self.assertEqual(check(), rm.key_id_text(recovery.key_id))
+            # A changed installer.
+            original = (dist / "setup.sh").read_bytes()
+            (dist / "setup.sh").write_bytes(b"# changed\n")
+            with self.assertRaisesRegex(rm.CheckError, "setup.sh does not match the manifest"):
+                check()
+            (dist / "setup.sh").write_bytes(original)
             cases = [
                 (dict(keys=list(rm.PLACEHOLDER_KEYS)), "still placeholders"),
                 (dict(version="1.2.4"), "the package is 1.2.4"),
                 (dict(distribution="other"), "not 'other'"),
                 (dict(assets=rm.ASSETS[:-1]), "the release has"),
+                (dict(assets=rm.PROGRAMS), "the release has"),
                 (dict(keys=[primary.public_text()]), "not trusted"),
             ]
             for overrides, expected in cases:
@@ -368,7 +390,7 @@ class BrandAndReleaseTests(unittest.TestCase):
                 (b"x" * (1024 * 1024 + 7), "does not carry the trusted keys"),
                 (carried + rm.PLACEHOLDER_KEYS[1].encode() + b"x" * (1024 * 1024), "placeholder"),
             ]:
-                (dist / rm.ASSETS[5]).write_bytes(content)
+                (dist / rm.PROGRAMS[5]).write_bytes(content)
                 rendered = rm.render_manifest(
                     "aitp", "1.2.3", {name: rm.file_metadata(dist / name) for name in rm.ASSETS}
                 )
@@ -377,12 +399,12 @@ class BrandAndReleaseTests(unittest.TestCase):
                 with self.assertRaisesRegex(rm.CheckError, expected):
                     check(artifacts=[])
             # A changed asset.
-            (dist / rm.ASSETS[0]).write_bytes(b"x" * (1024 * 1024))
+            (dist / rm.PROGRAMS[0]).write_bytes(b"x" * (1024 * 1024))
             with self.assertRaisesRegex(rm.CheckError, "does not match the manifest"):
                 check()
             # A symbolic link instead of an asset.
-            (dist / rm.ASSETS[0]).unlink()
-            (dist / rm.ASSETS[0]).symlink_to(dist / rm.ASSETS[1])
+            (dist / rm.PROGRAMS[0]).unlink()
+            (dist / rm.PROGRAMS[0]).symlink_to(dist / rm.PROGRAMS[1])
             with self.assertRaisesRegex(rm.CheckError, "not a regular file"):
                 check()
             # No signature.

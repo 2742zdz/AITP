@@ -2,11 +2,14 @@ name: Release
 
 # Three kinds of run, chosen by how the workflow starts (job "gate"):
 # - preview: a pull request, or a run by hand on a branch with
-#   publish_confirmation empty. Builds and checks the six programs and the
-#   unsigned manifest, uploads them as a workflow artifact; no release.
+#   publish_confirmation empty. Builds and checks the six programs, takes
+#   the two installers (scripts/setup.sh, scripts/setup.ps1) as they are in
+#   the commit, writes the unsigned manifest (listing all eight), uploads
+#   them as a workflow artifact; no release.
 # - draft: pushing a vX.Y.Z tag (on main, equal to the package version).
-#   The same build and checks, then a DRAFT release with the six programs
-#   and the unsigned aitp-manifest.json; their digests are recorded.
+#   The same build and checks, then a DRAFT release with the six programs,
+#   the two installers and the unsigned aitp-manifest.json; their digests
+#   are recorded.
 #   Nothing is published or signed.
 # - publish: a run by hand on that tag with publish_confirmation set to
 #   "publish <tag>", in the "release" environment (required reviewer).
@@ -47,9 +50,12 @@ concurrency:
   cancel-in-progress: ${{ !startsWith(github.ref, 'refs/tags/') }}
 
 env:
+  # The programs (built here) and the installers (taken from scripts/ of
+  # the commit). Both are release assets listed in the signed manifest.
   ASSETS: >-
     aitp-linux-x86_64 aitp-linux-aarch64 aitp-macos-x86_64 aitp-macos-aarch64
     aitp-windows-x86_64.exe aitp-windows-aarch64.exe
+  SCRIPTS: setup.sh setup.ps1
 
 jobs:
   gate:
@@ -339,17 +345,22 @@ jobs:
       - name: Assemble, check and write the unsigned manifest
         run: |
           read -r -a assets <<<"$ASSETS"
+          read -r -a scripts <<<"$SCRIPTS"
           mkdir dist
           for asset in "${assets[@]}"; do
             cp "release-assets/$asset/$asset" "dist/$asset"
           done
-          [ "$(ls dist | wc -l)" -eq 6 ]
-          python3 -B scripts/check_asset.py "${assets[@]/#/dist/}"
+          for script in "${scripts[@]}"; do
+            cp "scripts/$script" "dist/$script"
+          done
+          [ "$(ls dist | wc -l)" -eq 8 ]
+          python3 -B scripts/check_asset.py "${assets[@]/#/dist/}" "${scripts[@]/#/dist/}"
+          python3 -B scripts/check_release.py --build-dir "$GITHUB_WORKSPACE" "${scripts[@]/#/dist/}"
           python3 -B scripts/release_manifest.py generate --dist dist > "$RUNNER_TEMP/generate.txt"
           cat "$RUNNER_TEMP/generate.txt"
           # The release files; the publish run accepts only these digests.
-          (cd dist && sha256sum aitp-manifest.json "${assets[@]}") > release-digests.sha256
-          [ "$(wc -l < release-digests.sha256)" -eq 7 ]
+          (cd dist && sha256sum aitp-manifest.json "${assets[@]}" "${scripts[@]}") > release-digests.sha256
+          [ "$(wc -l < release-digests.sha256)" -eq 9 ]
           cat release-digests.sha256
           {
             echo '### Release files (sha256)'
@@ -395,8 +406,13 @@ jobs:
 
       - name: Check the bundle
         run: |
-          [ "$(ls bundle/dist | wc -l)" -eq 7 ]
+          read -r -a scripts <<<"$SCRIPTS"
+          [ "$(ls bundle/dist | wc -l)" -eq 9 ]
           (cd bundle/dist && sha256sum --check --strict ../release-digests.sha256)
+          # The installers are those of the tagged commit.
+          for script in "${scripts[@]}"; do
+            cmp "scripts/$script" "bundle/dist/$script"
+          done
           python3 -B scripts/release_manifest.py generate --dist bundle/dist --output "$RUNNER_TEMP/aitp-manifest.json" > /dev/null
           cmp "$RUNNER_TEMP/aitp-manifest.json" bundle/dist/aitp-manifest.json
 
@@ -405,7 +421,7 @@ jobs:
           GH_TOKEN: ${{ github.token }}
           TAG: ${{ github.ref_name }}
         run: |
-          read -r -a assets <<<"$ASSETS"
+          read -r -a assets <<<"$ASSETS $SCRIPTS"
           count="$(python3 -B scripts/github_release.py count --repository "$GITHUB_REPOSITORY" --tag "$TAG")"
           if [ "$count" != 0 ]; then
             echo "::error::a release of $TAG already exists ($count); delete the draft to build it again" >&2
@@ -428,7 +444,7 @@ jobs:
           GH_TOKEN: ${{ github.token }}
           TAG: ${{ github.ref_name }}
         run: |
-          read -r -a assets <<<"$ASSETS"
+          read -r -a assets <<<"$ASSETS $SCRIPTS"
           names=(--asset aitp-manifest.json)
           for asset in "${assets[@]}"; do names+=(--asset "$asset"); done
           ids="$(gh api --paginate "repos/$GITHUB_REPOSITORY/releases?per_page=100" \
@@ -480,15 +496,16 @@ jobs:
           python-version: '3.12'
 
       # Only the one release of this tag, built by a successful tag run of
-      # this commit, with exactly the six programs and the manifest, and
-      # perhaps a signature (signed offline with the recovery key).
+      # this commit, with exactly the six programs, the two installers and
+      # the manifest, and perhaps a signature (signed offline with the
+      # recovery key).
       - name: Download the draft
         id: fetch
         env:
           GH_TOKEN: ${{ github.token }}
           TAG: ${{ github.ref_name }}
         run: |
-          read -r -a assets <<<"$ASSETS"
+          read -r -a assets <<<"$ASSETS $SCRIPTS"
           names=(--asset aitp-manifest.json)
           for asset in "${assets[@]}"; do names+=(--asset "$asset"); done
           python3 -B scripts/github_release.py fetch --repository "$GITHUB_REPOSITORY" --tag "$TAG" \
@@ -513,7 +530,7 @@ jobs:
           STATE: ${{ steps.fetch.outputs.state }}
           OPTIONAL: ${{ steps.fetch.outputs.optional }}
         run: |
-          read -r -a assets <<<"$ASSETS"
+          read -r -a assets <<<"$ASSETS $SCRIPTS"
           names=(--asset aitp-manifest.json)
           for asset in "${assets[@]}"; do names+=(--asset "$asset"); done
           case "$OPTIONAL" in
@@ -526,8 +543,13 @@ jobs:
             exit 1
           fi
           digests="$RUNNER_TEMP/release-digests/release-digests.sha256"
-          [ "$(wc -l < "$digests")" -eq 7 ]
+          [ "$(wc -l < "$digests")" -eq 9 ]
           (cd dist && sha256sum --check --strict "$digests")
+          # The installers are those of the tagged commit.
+          read -r -a scripts <<<"$SCRIPTS"
+          for script in "${scripts[@]}"; do
+            cmp "scripts/$script" "dist/$script"
+          done
           python3 -B scripts/release_manifest.py generate --dist dist --output "$RUNNER_TEMP/aitp-manifest.json" > /dev/null
           cmp "$RUNNER_TEMP/aitp-manifest.json" dist/aitp-manifest.json
           python3 -B scripts/check_asset.py "${assets[@]/#/dist/}"
@@ -576,7 +598,7 @@ jobs:
           RELEASE_ID: ${{ steps.fetch.outputs.id }}
         run: |
           [[ "$RELEASE_ID" =~ ^[0-9]+$ ]]
-          read -r -a assets <<<"$ASSETS"
+          read -r -a assets <<<"$ASSETS $SCRIPTS"
           names=(--asset aitp-manifest.json --asset aitp-manifest.json.minisig)
           for asset in "${assets[@]}"; do names+=(--asset "$asset"); done
           endpoint="repos/$GITHUB_REPOSITORY/releases/$RELEASE_ID"

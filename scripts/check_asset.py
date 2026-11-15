@@ -13,6 +13,10 @@ Usage: check_asset.py ASSET [ASSET ...]
   machine, linked with /Brepro (its debug directory has the reproducible
   build entry, so the image carries no time stamp), and naming no PDB by a
   path (a CodeView entry, if any, names the file only).
+* setup.sh, setup.ps1: the installers, as text that reads the same however
+  it is fetched (`curl | bash`, `irm` in Windows PowerShell): at most 1 MiB
+  of printable ASCII with LF line ends, ending in a line break; setup.sh
+  starts with `#!/usr/bin/env bash`.
 
 The release check (check_release.py) covers the contents; this covers the
 format. Exits 0 when every asset passes, 1 otherwise.
@@ -154,6 +158,22 @@ def check_pe(data: bytes, machine: int) -> str:
     return "PE32+ image linked with /Brepro"
 
 
+# --- installers -------------------------------------------------------------
+
+SCRIPT_LIMIT = 1024 * 1024
+
+
+def check_script(data: bytes, first_line: bytes) -> str:
+    require(0 < len(data) <= SCRIPT_LIMIT, f"not between 1 and {SCRIPT_LIMIT} bytes")
+    require(data.isascii(), "not ASCII text")
+    require(b"\r" not in data, "has CR line ends")
+    require(not any((byte < 0x20 and byte not in (0x09, 0x0A)) or byte == 0x7F for byte in data),
+            "contains a control character")
+    require(data.endswith(b"\n"), "does not end with a line break")
+    require(data.startswith(first_line), f"does not start with {first_line!r}")
+    return "ASCII script with LF line ends"
+
+
 ASSETS = {
     "aitp-linux-x86_64": (check_elf, 62),
     "aitp-linux-aarch64": (check_elf, 183),
@@ -161,6 +181,8 @@ ASSETS = {
     "aitp-macos-aarch64": (check_macho, 0x0100000C),
     "aitp-windows-x86_64.exe": (check_pe, 0x8664),
     "aitp-windows-aarch64.exe": (check_pe, 0xAA64),
+    "setup.sh": (check_script, b"#!/usr/bin/env bash\n"),
+    "setup.ps1": (check_script, b""),
 }
 
 

@@ -124,12 +124,45 @@ class CheckAssetTest(unittest.TestCase):
         self.refuses("aitp-windows-x86_64.exe", pe(pdb=b"D:\\a\\b\\aitp.pdb"), "PDB by a path")
         self.refuses("aitp-windows-x86_64.exe", pe(pdb=b"/x/aitp.pdb"), "PDB by a path")
 
+    def test_installers(self) -> None:
+        self.assertEqual(self.check("setup.sh", b"#!/usr/bin/env bash\necho\tok\n"), "ASCII script with LF line ends")
+        self.assertEqual(self.check("setup.ps1", b"param()\n"), "ASCII script with LF line ends")
+        self.refuses("setup.sh", b"#!/bin/sh\n", "does not start with")
+        self.refuses("setup.ps1", b"param()\r\n", "CR line ends")
+        self.refuses("setup.ps1", b"\xef\xbb\xbfparam()\n", "not ASCII")
+        self.refuses("setup.ps1", "# caf\u00e9\n".encode(), "not ASCII")
+        self.refuses("setup.ps1", b"param()", "line break")
+        self.refuses("setup.ps1", b"a\x00\n", "control character")
+        self.refuses("setup.ps1", b"", "not between")
+        self.refuses("setup.ps1", b"#" * (1024 * 1024) + b"\n", "not between")
+        # The installers of this checkout pass.
+        for name in ("setup.sh", "setup.ps1"):
+            self.assertEqual(check_asset.check(SCRIPTS / name), "ASCII script with LF line ends")
+
     def test_names(self) -> None:
         self.refuses("aitp-linux-riscv64", elf(), "not a release asset name")
         self.refuses("aitp-windows-x86_64", pe(), "not a release asset name")
 
 
 class CheckReleaseTest(unittest.TestCase):
+    def test_installers_name_no_other_distribution(self) -> None:
+        environ = {"AITP_TEST_FOREIGN_NAMES": "otherdist"}
+        with tempfile.TemporaryDirectory() as directory:
+            build = Path(directory) / "build" / "dir"
+            for name, text, expected in [
+                ("setup.sh", "#!/usr/bin/env bash\n# KTest\n", "ktest"),
+                ("setup.ps1", "# OtherDist installer\n", "otherdist"),
+            ]:
+                path = Path(directory) / name
+                path.write_text(text)
+                with self.assertRaisesRegex(check_release.CheckError, f"names another distribution.*{expected}"):
+                    with contextlib.redirect_stdout(io.StringIO()):
+                        check_release.check([path], [build], environ)
+            # The installers of this checkout pass (no build path or keys needed).
+            with contextlib.redirect_stdout(io.StringIO()) as output:
+                check_release.check([SCRIPTS / "setup.sh", SCRIPTS / "setup.ps1"], [build], environ)
+            self.assertIn("2 installer(s)", output.getvalue())
+
     def test_build_paths_in_utf8_and_utf16(self) -> None:
         path = "D:\\a\\AITP\\AITP"
         for encoding in ("utf-8", "utf-16-le"):
