@@ -302,6 +302,9 @@ class SignManifestTest(unittest.TestCase):
                 ("", "not set or empty"),
                 ("not base64 at all!" + good[:20], "not base64"),
                 (base64.b64encode(key_id + seed[:31]).decode(), "not 40 bytes"),
+                (good.rstrip("="), "not base64"),
+                # 40 bytes end in "X==" where X carries 4 unused bits: set one.
+                (good[:-3] + chr(ord(good[-3]) + 1) + "==", "not canonical base64"),
                 # A real key the brand does not trust.
                 (good, "not one the AITP program trusts"),
             ):

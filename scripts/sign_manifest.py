@@ -52,12 +52,16 @@ def read_key(environ, name: str) -> tuple[bytes, bytes]:
     value = environ.pop(name, None)
     if not value:
         raise SignError(f"the signing key variable {name} is not set or empty")
+    text = value.strip()
+    value = None
     try:
-        raw = base64.b64decode(value.strip(), validate=True)
+        raw = base64.b64decode(text, validate=True)
     except (binascii.Error, ValueError):
         raise SignError(f"the signing key in {name} is not base64") from None
-    finally:
-        value = None
+    # Only the canonical spelling (padding bits zero, padded).
+    if base64.b64encode(raw).decode() != text:
+        raise SignError(f"the signing key in {name} is not canonical base64")
+    text = None
     if len(raw) != KEY_LENGTH:
         raise SignError(f"the signing key in {name} is not {KEY_LENGTH} bytes (key id and Ed25519 seed)")
     return raw[:8], raw[8:]

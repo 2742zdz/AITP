@@ -105,19 +105,34 @@ jobs:
             echo "::error::a placeholder signing key switch is named in the repository (git grep: $found)" >&2
             exit 1
           fi
-          # The signing key is read in exactly one place: the publish job's
-          # signing step (the pattern is split so that it does not find
-          # this line).
-          uses="$(git grep -n -F "secret""s." -- .github || true)"
-          dollar='$'
-          expected="AITP_SIGNING_KEY: ${dollar}{{ secret""s.AITP_SIGNING_KEY }}"
-          if [ "$(printf '%s\n' "$uses" | grep -c .)" != 1 ] ||
-              [ "$(printf '%s\n' "$uses" | sed 's/^[^:]*:[0-9]*: *//')" != "$expected" ] ||
-              [ "${uses%%:*}" != .github/workflows/release.yml ]; then
-            echo "::error::workflow secrets used outside the publish signing step:" >&2
-            printf '%s\n' "$uses" >&2
-            exit 1
-          fi
+          # The signing key is read in exactly one place: the env of the
+          # publish job's signing step. Any other mention of workflow
+          # secrets (job env, toJSON, inherit, another step) fails here.
+          # This guards against mistakes; the boundary itself is the
+          # "release" environment (required reviewer, v* tags only), which
+          # alone holds the secret.
+          python3 -B - <<'PY'
+          import pathlib, re, sys
+          word = "secret" + "s"
+          step = "      - name: Sign the manifest with the release key"
+          expected = "          AITP_SIGNING_KEY: $" + "{{ " + word + ".AITP_SIGNING_KEY }}"
+          hits = []
+          for path in sorted(pathlib.Path(".github").rglob("*")):
+              if path.is_file():
+                  lines = path.read_text(encoding="utf-8", errors="replace").splitlines()
+                  hits += [(path, number, lines) for number, line in enumerate(lines)
+                           if re.search(word, line, re.IGNORECASE) and not line.lstrip().startswith("#")]
+          ok = len(hits) == 1
+          if ok:
+              path, number, lines = hits[0]
+              names = [index for index in range(number) if lines[index].startswith("      - ")]
+              ok = (str(path) == ".github/workflows/release.yml" and lines[number] == expected
+                    and bool(names) and lines[names[-1]] == step)
+          if not ok:
+              for path, number, lines in hits:
+                  print(f"{path}:{number + 1}: {lines[number]}", file=sys.stderr)
+              sys.exit("::error::the signing key may be read only by the publish job's signing step")
+          PY
           if [ "$mode" != preview ]; then
             version="$(python3 -B -c 'import sys; sys.path.insert(0, "scripts"); import release_manifest; print(release_manifest.cargo_version())')"
             if [ "$REF_NAME" != "v$version" ]; then
