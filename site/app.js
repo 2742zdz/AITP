@@ -194,6 +194,7 @@
       'key-cmd': 'This key contains ", % or !, which cmd cannot pass on safely. Use the PowerShell tab, or leave the key empty and type it when the installer asks.',
       'warn-http': 'Plain http: the API key would travel unencrypted. Use https unless the Gateway runs on this machine.',
       'warn-v1': 'The URL ends in /v1. Usually the Gateway root without /v1 is meant; check your Gateway\'s instructions.',
+      'from-link': 'This address was filled in by the link you opened ({host}); AITP does not check it. Continue only if this is your Gateway: your key and requests will go there.',
       afterTitle: 'Afterwards',
       afterClaude: 'Run Claude Code as usual; it now goes through the local proxy:',
       afterCodex: 'Codex goes through the proxy with:',
@@ -248,6 +249,7 @@
       'key-cmd': '此 Key 含有 "、% 或 !，cmd 无法安全传递。请改用 PowerShell 标签页，或将 Key 留空，等安装程序询问时再输入。',
       'warn-http': '这是明文 http：API Key 将不加密传输。除非 Gateway 就在本机，请使用 https。',
       'warn-v1': '地址以 /v1 结尾。通常应填不带 /v1 的 Gateway 根地址，请核对 Gateway 的说明。',
+      'from-link': '此地址由你打开的链接预填（{host}），AITP 不对它做任何核实。确认这是你自己的 Gateway 再继续：你的 Key 和请求都会发往它。',
       afterTitle: '之后',
       afterClaude: '照常运行 Claude Code，它已经通过本地代理连接：',
       afterCodex: 'Codex 通过代理运行：',
@@ -270,7 +272,9 @@
   var state = {
     lang: 'en',
     shell: 'bash',
-    showKey: false
+    showKey: false,
+    // The Gateway a link filled in (#base_url=...), if any.
+    linkUrl: null
   };
 
   function $(id) {
@@ -351,6 +355,10 @@
     var warnings = base.warnings || [];
     setMessage($('url-warning'), warnings.length ? 'warn-' + warnings[0] : null);
     setMessage($('url-warning-2'), warnings.length > 1 ? 'warn-' + warnings[1] : null);
+    // A Gateway prefilled by a link (#base_url=...) is named as such while it is unchanged.
+    var fromLink = state.linkUrl && !base.error && base.url === state.linkUrl;
+    $('url-from-link').textContent = fromLink ? t('from-link').replace('{host}', new URL(base.url).host) : '';
+    $('url-from-link').hidden = !fromLink;
 
     $('shell-where').textContent = t(state.shell + 'Where');
     $('after-start').hidden = !$('opt-no-start').checked;
@@ -435,7 +443,10 @@
 
     var fromLink = fragmentBaseUrl(window.location.hash);
     var remembered = load(STORE_URL);
-    if (fromLink) $('base-url').value = fromLink;
+    if (fromLink) {
+      $('base-url').value = fromLink;
+      state.linkUrl = fromLink;
+    }
     else if (remembered && !parseBaseUrl(remembered).error) $('base-url').value = remembered;
 
     $('base-url').addEventListener('input', render);

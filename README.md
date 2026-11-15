@@ -11,9 +11,10 @@ it installs, and `aitp uninstall` removes them again.
 [aitp.lol](https://aitp.lol) generates the command below for your Gateway
 and key (bash, PowerShell or cmd), in the browser: it sends nothing and
 stores no key (it remembers the Gateway URL and the language). Its `https://aitp.lol/setup.sh` and `https://aitp.lol/setup.ps1`
-are copies of the latest release's installers, published only after the
-release manifest's signature verifies with the keys built into the program
-and both match the manifest (`.github/workflows/pages.yml`). The GitHub URLs
+are copies of the installers of the release that was the latest when the
+site was last deployed (it is deployed again after every publish), taken
+only after the release manifest's signature verifies with the keys built
+into the program and both match the manifest (`.github/workflows/pages.yml`). The GitHub URLs
 below keep working.
 
 Linux and macOS (bash; x86_64 and arm64):

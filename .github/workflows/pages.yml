@@ -32,9 +32,16 @@ defaults:
   run:
     shell: bash
 
-# One deployment at a time; a running one is never cancelled.
+# One deployment at a time; a running one is never cancelled. A run that
+# will not deploy (after a Release run that is not a successful run by hand,
+# e.g. a pull request preview) gets a group of its own, so it cannot take
+# the place of a deployment waiting in the queue.
 concurrency:
-  group: pages
+  group: >-
+    ${{ github.event_name == 'workflow_run' &&
+        (github.event.workflow_run.conclusion != 'success' ||
+         github.event.workflow_run.event != 'workflow_dispatch') &&
+        format('pages-skip-{0}', github.run_id) || 'pages' }}
   cancel-in-progress: false
 
 jobs:
