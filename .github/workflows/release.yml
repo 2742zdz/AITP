@@ -108,9 +108,10 @@ jobs:
           # The signing key is read in exactly one place: the env of the
           # publish job's signing step. Any other mention of workflow
           # secrets (job env, toJSON, inherit, another step) fails here.
-          # This guards against mistakes; the boundary itself is the
-          # "release" environment (required reviewer, v* tags only), which
-          # alone holds the secret.
+          # (A text check of the workflow files, not an analysis of what
+          # Actions evaluates.) This guards against mistakes; the boundary
+          # itself is the "release" environment (required reviewer, v* tags
+          # only), which alone holds the secret.
           python3 -B - <<'PY'
           import pathlib, re, sys
           word = "secret" + "s"
@@ -118,7 +119,7 @@ jobs:
           expected = "          AITP_SIGNING_KEY: $" + "{{ " + word + ".AITP_SIGNING_KEY }}"
           hits = []
           for path in sorted(pathlib.Path(".github").rglob("*")):
-              if path.is_file():
+              if path.is_file() and not path.is_symlink() and path.suffix in (".yml", ".yaml"):
                   lines = path.read_text(encoding="utf-8", errors="replace").splitlines()
                   hits += [(path, number, lines) for number, line in enumerate(lines)
                            if re.search(word, line, re.IGNORECASE) and not line.lstrip().startswith("#")]
