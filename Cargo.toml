@@ -1,6 +1,6 @@
 [package]
 name = "proxy-cli"
-version = "0.1.0"
+version = "0.1.1"
 edition = "2024"
 rust-version = "1.97"
 description = "Managed local proxy client for Claude Code and Codex: the distribution-neutral kernel"
