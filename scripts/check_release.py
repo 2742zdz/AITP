@@ -19,6 +19,9 @@ Each program must
 Only the test brand is refused by default; a distribution built on this
 kernel passes its own names in AITP_TEST_FOREIGN_NAMES in its own CI.
 
+The installers (setup.sh, setup.ps1, by file name) are checked only for the
+names of other distributions: they carry no brand data, keys or paths.
+
 Exits 0 when every program passes, 1 otherwise (the reason on stderr).
 """
 
@@ -201,9 +204,15 @@ def check(programs: list[Path], build_dirs: list[Path], environ=os.environ) -> N
         tool.require_real_keys(keys)
     except tool.CheckError as error:
         raise CheckError(str(error)) from error
+    checked = 0
     for program in programs:
         require(program.is_file(), f"program is missing: {program}")
         data = program.read_bytes()
+        if program.name in tool.SCRIPTS:
+            found = [name for name in names if name.encode() in data.lower()]
+            require(not found, f"{program} names another distribution: {found}")
+            continue
+        checked += 1
         missing = [marker.decode() for marker in markers if marker not in data]
         require(not missing, f"{program} lacks AITP brand data: {missing}")
         view = path_view(data)
@@ -215,7 +224,8 @@ def check(programs: list[Path], build_dirs: list[Path], environ=os.environ) -> N
             tool.require_program_keys(program, keys)
         except tool.CheckError as error:
             raise CheckError(str(error)) from error
-    print(f"{len(programs)} program(s) carry the AITP brand data and real signing keys, and no build machine path")
+    print(f"{checked} program(s) carry the AITP brand data and real signing keys, and no build machine path; "
+          f"{len(programs) - checked} installer(s) name no other distribution")
 
 
 def main(argv=None) -> int:

@@ -2,6 +2,8 @@
 
 *.cmd text eol=crlf
 *.ps1 text eol=crlf
+# The installer is a release asset: the same LF bytes in every checkout.
+scripts/setup.ps1 text eol=lf
 *.sh text eol=lf
 *.py text eol=lf
 *.rs text eol=lf

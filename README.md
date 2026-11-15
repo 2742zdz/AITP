@@ -6,6 +6,73 @@ traffic to an API relay Gateway that you choose with a base URL and an API
 key. AITP marks the client settings, certificates and background service
 it installs, and `aitp uninstall` removes them again.
 
+## Install
+
+Linux and macOS (bash; x86_64 and arm64):
+
+```sh
+curl -fsSL https://github.com/2742zdz/AITP/releases/latest/download/setup.sh | bash -s -- \
+    --base-url https://gateway.example.com --api-key '<api_key>'
+```
+
+Windows (Windows PowerShell 5.1 or PowerShell 7; x64 and arm64):
+
+```powershell
+& ([scriptblock]::Create((irm https://github.com/2742zdz/AITP/releases/latest/download/setup.ps1))) -BaseUrl 'https://gateway.example.com' -ApiKey '<api_key>'
+```
+
+The installer reads `aitp-manifest.json` of the latest release, downloads
+the program for your platform from that same release, checks its size and
+SHA-256 against the manifest and installs it: `~/.local/bin/aitp`, or
+`%LOCALAPPDATA%\AITP\bin\aitp.exe` (added to your user PATH) on Windows. An
+installed program that is already current is not downloaded again; a newer
+one is kept. A replaced program stays next to it as `aitp-previous`
+(`aitp-previous.exe`). Then it runs `aitp init --base-url ... --api-key ...`,
+which configures Claude Code and starts (or refreshes) the local proxy
+service. Running the installer again updates AITP and applies the given
+Gateway again.
+
+| bash | PowerShell | |
+| --- | --- | --- |
+| `--base-url URL` | `-BaseUrl URL` | the Gateway (required) |
+| `--api-key KEY` | `-ApiKey KEY` | the API key; omitted: asked for without echo |
+| `--install-dir DIR` | `-InstallDir DIR` | another install directory (also `AITP_INSTALL_DIR`) |
+| `--no-start` | `-NoStart` | configure, but do not start the local proxy (`aitp start` later) |
+| `--codex` | `-Codex` | also configure Codex (`aitp init-codex`) |
+| `--install-only` | `-InstallOnly` | only install or update the program |
+
+On Windows a running `aitp.exe` cannot be replaced: the installer stops the
+local proxies that run, replaces the program and starts them again (also
+with `-NoStart`, and also when the installation fails). The replacement is
+two renames (the old program aside, the new one into place), not one atomic
+step: if the second rename fails, the installer moves the old program back;
+if even that fails (or the installer is killed in between), the old program
+is left next to it as `.aitp.replace.*` and the error names the file to
+rename back to `aitp.exe`.
+
+Afterwards run Claude Code as usual (`claude`): `aitp init` points its user
+settings (`~/.claude/settings.json`) at the local proxy. `aitp claude` works
+too and starts the proxy first if it is not running. Codex goes through the
+proxy with `aitp codex`.
+
+The installer never prints the API key. It hands it to `aitp init` as a
+command-line argument, the only way `aitp init` takes it, so it is visible
+to other processes of the same machine while `aitp init` runs (and, in the
+one-liners above, in your shell history: omit `--api-key` / `-ApiKey` to be
+asked for it instead).
+
+**Trust.** The installer trusts what it downloads because it comes over
+HTTPS from GitHub; it checks the program against the manifest, but does not
+verify the manifest's minisign signature itself. `aitp update` does (see
+below). To check a release by hand before installing, see "To check the
+keys yourself".
+
+To remove AITP (services, settings, data and the program):
+
+```sh
+aitp uninstall
+```
+
 ## Usage
 
 Configure Claude Code (and, separately, Codex) for a Gateway:
@@ -103,7 +170,9 @@ and arm64.
 Releases are built and signed by the `Release` workflow
 (`.github/workflows/release.yml`). A pull request, or a run by hand on a
 branch, builds a preview of the six programs and the unsigned manifest; it
-never sees the signing key.
+never sees the signing key. The manifest also lists the two installers,
+`setup.sh` and `setup.ps1`, published with each release exactly as they are
+in `scripts/` of the tagged commit.
 
 1. Set the version in `Cargo.toml` (and `Cargo.lock`) on `main`, then push the
    tag `vX.Y.Z` for that commit. The workflow builds and checks the six
@@ -141,7 +210,7 @@ minisign -V -p aitp-recovery.pub -m aitp-manifest.json
 Upload only `aitp-manifest.json.minisig` to the draft
 (`gh release upload vX.Y.Z aitp-manifest.json.minisig`, or edit the draft),
 optionally check it with `python3 scripts/release_manifest.py verify
---manifest aitp-manifest.json --dist <directory with the six programs>`,
+--manifest aitp-manifest.json --dist <directory with the release files>`,
 then publish as in step 2.
 
 A failed tag run leaves no release or only a draft; delete the draft before

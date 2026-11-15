@@ -72,6 +72,15 @@ jobs:
           python3 scripts/test_release_tools.py
           node --test scripts/test_vscode_certificates.js
 
+      # The installers against a fake release server: setup.sh under bash,
+      # setup.ps1 under PowerShell 7 (pwsh).
+      - name: Test the installers
+        run: |
+          shellcheck --version | head -n 2
+          shellcheck -s bash scripts/setup.sh
+          command -v pwsh
+          SETUP_TEST_POWERSHELL=pwsh python3 scripts/test_setup.py -v
+
       # The release build (paths remapped, as published) runs, carries the
       # brand data and the real update signing keys, and names no build path.
       - name: Build and check the release program
@@ -170,6 +179,12 @@ jobs:
           cargo test --locked
           cargo test --locked --features contract --bin aitp
 
+      # setup.sh under the system bash (3.2) and macOS tools.
+      - name: Test the installer
+        run: |
+          /bin/bash --version | head -n 1
+          SETUP_TEST_BASH=/bin/bash SETUP_TEST_POWERSHELL=none python3 scripts/test_setup.py -v BashSetupTests ScriptFormatTests
+
   windows:
     name: Windows
     runs-on: windows-latest
@@ -201,6 +216,14 @@ jobs:
             exit 1
           fi
           echo "$ran windows_desktop_runtime test(s) passed"
+
+      # setup.ps1 under Windows PowerShell 5.1 and PowerShell 7, with a
+      # compiled stub program.
+      - name: Test the installer
+        run: |
+          powershell -NoProfile -Command '$PSVersionTable.PSVersion.ToString()'
+          pwsh -NoProfile -Command '$PSVersionTable.PSVersion.ToString()'
+          python scripts/test_setup.py -v PowerShellSetupTests_powershell PowerShellSetupTests_pwsh
 
       # Platform-specific renderings (Windows update helper) run through the
       # contract entries on this platform.

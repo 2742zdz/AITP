@@ -1382,6 +1382,36 @@ async fn a_newer_release_downloads_the_verified_asset_of_its_own_version() {
     }
 }
 
+/// A release also lists its installers (setup.sh, setup.ps1: small, not
+/// programs); the program reads only its own platform's asset.
+#[tokio::test]
+async fn a_manifest_that_also_lists_the_installers_updates() {
+    let bytes = release_bytes();
+    let sha = sha256_hex(&bytes);
+    let manifest = serde_json::to_vec(&serde_json::json!({
+        "manifest_schema": 1,
+        "distribution": "ktest",
+        "version": "9.9.9",
+        "assets": {
+            ASSET: { "sha256": sha, "size": bytes.len() },
+            "setup.sh": { "sha256": "a".repeat(64), "size": 20_000 },
+            "setup.ps1": { "sha256": "b".repeat(64), "size": 1 },
+        },
+    }))
+    .unwrap();
+    let port = serve(release(manifest, bytes.clone())).await;
+    match fetch(port, "1.0.0", "0").await.unwrap() {
+        FixedUpdate::Download {
+            bytes: got,
+            version,
+        } => {
+            assert_eq!(version, "9.9.9");
+            assert_eq!(got, bytes);
+        }
+        FixedUpdate::Current(message) => panic!("{message}"),
+    }
+}
+
 #[tokio::test]
 async fn no_published_release_is_a_clear_error_without_a_download() {
     let port = serve(Routes::new()).await;
