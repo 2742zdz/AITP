@@ -1405,6 +1405,12 @@ fn next_version_after(version: &str) -> String {
 /// are printed; the caller then proves the result by running it.
 #[cfg_attr(target_os = "linux", allow(dead_code))]
 fn replace_version(program: &mut [u8], from: &str, to: &str) {
+    replace_version_in(program, from, to, false);
+}
+
+/// `replace_version`, or with `everywhere` every occurrence (packed or not).
+#[cfg_attr(target_os = "linux", allow(dead_code))]
+fn replace_version_in(program: &mut [u8], from: &str, to: &str, everywhere: bool) {
     let (from, to) = (from.as_bytes(), to.as_bytes());
     assert_eq!(from.len(), to.len());
     let part_of_version = |byte: u8| byte.is_ascii_digit() || byte == b'.';
@@ -1425,7 +1431,7 @@ fn replace_version(program: &mut [u8], from: &str, to: &str) {
         !occurrences.is_empty(),
         "the version text is not in the program"
     );
-    let chosen = if alone.is_empty() {
+    let chosen = if alone.is_empty() || everywhere {
         for &at in &occurrences {
             let context =
                 &program[at.saturating_sub(12)..(at + from.len() + 12).min(program.len())];
@@ -1483,19 +1489,36 @@ fn candidate_program(sandbox: &Sandbox, version: &str) -> Vec<u8> {
     }
     #[cfg(not(target_os = "linux"))]
     {
-        let mut program = std::fs::read(BINARY).unwrap();
+        let original = std::fs::read(BINARY).unwrap();
         let current = env!("CARGO_PKG_VERSION");
-        if version != current {
-            replace_version(&mut program, current, version);
-        }
         // Checked outside the sandbox (which is scanned for names).
         let _ = sandbox;
         let check = tempfile::tempdir().unwrap();
-        let path = check
-            .path()
-            .join(format!("candidate-check{}", std::env::consts::EXE_SUFFIX));
-        write_program(&path, &program);
-        assert_eq!(version_output(&path), format!("aitp {version}"));
+        // Standalone occurrences first; if the program's own version text is
+        // packed (Mach-O) while the same digits also stand alone elsewhere,
+        // the result still reports `current`: then replace every occurrence.
+        let attempt = |everywhere: bool| {
+            // A fresh file each time: macOS caches the signature of a file
+            // that already ran.
+            let path = check.path().join(format!(
+                "candidate-check-{}{}",
+                u8::from(everywhere),
+                std::env::consts::EXE_SUFFIX
+            ));
+            let mut program = original.clone();
+            if version != current {
+                replace_version_in(&mut program, current, version, everywhere);
+            }
+            write_program(&path, &program);
+            let reported = version_output(&path);
+            (path, reported)
+        };
+        let expected = format!("aitp {version}");
+        let (mut path, mut reported) = attempt(false);
+        if reported != expected {
+            (path, reported) = attempt(true);
+        }
+        assert_eq!(reported, expected);
         let program = std::fs::read(&path).unwrap();
         // A scanner may still hold it briefly on Windows; then it stays.
         let _ = check.close();
@@ -1869,6 +1892,10 @@ fn test_helpers_read_keys_and_versions_exactly() {
     let mut program = b"x10.1.0 0.1.00".to_vec();
     replace_version(&mut program, "0.1.0", "0.1.1");
     assert_eq!(program, b"x10.1.1 0.1.10");
+    // Everywhere: standalone and packed occurrences alike.
+    let mut program = b"0.1.0 x10.1.0".to_vec();
+    replace_version_in(&mut program, "0.1.0", "0.1.1", true);
+    assert_eq!(program, b"0.1.1 x10.1.1");
     let mut program = b"aaa KEYKEY bbb".to_vec();
     replace_bytes(&mut program, b"KEYKEY", b"NEWKEY", 1);
     assert_eq!(program, b"aaa NEWKEY bbb");
