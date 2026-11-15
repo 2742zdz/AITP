@@ -52,15 +52,37 @@ KEY = "sk-te st'k\"ey\\\" $(touch pwned) `id` ;&|<>*?%PATH%!é"
 PADDING = 1024 * 1024 + 64
 BASE_URL = "https://gateway.example.com"
 
+# The stub keeps which proxies run as files active-<environment> in
+# AITP_STUB_STATE: `status` reports them, `stop`/`start` change them, `init`
+# (claude) and `init-codex` (codex) start theirs unless AITP_SKIP_START=1.
+# AITP_STUB_FAIL=<command> makes that command fail. Calls other than
+# `status` are logged.
 STUB_SH = """#!/bin/sh
 # aitp test stub {version} {variant}
 if [ "$1" = --version ]; then echo "aitp {version}"; exit 0; fi
+environment=claude
+command="$1"
+if [ "$1" = --environment ]; then environment="$2"; command="$3"; fi
+[ "$command" != init-codex ] || environment=codex
+state="${{AITP_STUB_STATE:-}}"
+if [ "$command" = status ]; then
+  if [ -n "$state" ] && [ -e "$state/active-$environment" ]; then echo "service active: yes"; else echo "service active: no"; fi
+  exit 0
+fi
 {{
   echo "--- call"
   echo "AITP_BINARY_UPDATED=${{AITP_BINARY_UPDATED-unset}}"
   echo "AITP_SKIP_START=${{AITP_SKIP_START-unset}}"
   for argument in "$@"; do printf 'arg=%s\\n' "$argument"; done
 }} >> "$AITP_STUB_LOG"
+[ "${{AITP_STUB_FAIL:-}}" != "$command" ] || exit 3
+if [ -n "$state" ]; then
+  case "$command" in
+    stop) rm -f "$state/active-$environment" ;;
+    start) : > "$state/active-$environment" ;;
+    init|init-codex) [ "${{AITP_SKIP_START:-}}" = 1 ] || : > "$state/active-$environment" ;;
+  esac
+fi
 exit 0
 """
 
@@ -71,12 +93,27 @@ using System.Text;
 public static class Stub {{
     public static int Main(string[] args) {{
         if (args.Length == 1 && args[0] == "--version") {{ Console.WriteLine("aitp {version}"); return 0; }}
+        string environment = "claude", command = args.Length > 0 ? args[0] : "";
+        if (args.Length >= 3 && args[0] == "--environment") {{ environment = args[1]; command = args[2]; }}
+        if (command == "init-codex") environment = "codex";
+        string state = Environment.GetEnvironmentVariable("AITP_STUB_STATE") ?? "";
+        string active = state.Length > 0 ? Path.Combine(state, "active-" + environment) : "";
+        if (command == "status") {{
+            Console.WriteLine(active.Length > 0 && File.Exists(active) ? "service active: yes" : "service active: no");
+            return 0;
+        }}
         var log = new StringBuilder();
         log.Append("--- call\\n");
         log.Append("AITP_BINARY_UPDATED=" + (Environment.GetEnvironmentVariable("AITP_BINARY_UPDATED") ?? "unset") + "\\n");
         log.Append("AITP_SKIP_START=" + (Environment.GetEnvironmentVariable("AITP_SKIP_START") ?? "unset") + "\\n");
         foreach (var argument in args) log.Append("arg=" + argument + "\\n");
         File.AppendAllText(Environment.GetEnvironmentVariable("AITP_STUB_LOG"), log.ToString(), new UTF8Encoding(false));
+        if (Environment.GetEnvironmentVariable("AITP_STUB_FAIL") == command) return 3;
+        if (active.Length > 0) {{
+            if (command == "stop") File.Delete(active);
+            else if (command == "start") File.WriteAllText(active, "");
+            else if ((command == "init" || command == "init-codex") && Environment.GetEnvironmentVariable("AITP_SKIP_START") != "1") File.WriteAllText(active, "");
+        }}
         return 0; // {variant}
     }}
 }}
@@ -183,6 +220,8 @@ class SetupTests:
         self.home.mkdir()
         self.install = self.top / "install dir"
         self.log = self.top / "stub.log"
+        self.state = self.top / "state"
+        self.state.mkdir()
         self.mirror = Mirror(self.top / "mirror")
         self.current = stub(self.top, VERSION)
         self.files = {name: self.current for name in PROGRAMS}
@@ -197,7 +236,8 @@ class SetupTests:
     def environment(self) -> dict:
         environment = {key: value for key, value in os.environ.items()
                        if not key.startswith("AITP_") and key.lower() not in ("http_proxy", "https_proxy", "all_proxy")}
-        environment.update(HOME=str(self.home), AITP_STUB_LOG=str(self.log), NO_PROXY="*", no_proxy="*",
+        environment.update(HOME=str(self.home), AITP_STUB_LOG=str(self.log), AITP_STUB_STATE=str(self.state),
+                           NO_PROXY="*", no_proxy="*",
                            AITP_SETUP_RELEASES_URL=self.mirror.releases)
         return environment
 
@@ -345,6 +385,23 @@ class SetupTests:
         twice = canonical(good).replace(b'"assets":{', b'"assets":{"setup.sh":' + installer + b',"setup.sh":' + installer + b",")
         self.mirror.publish(self.files, twice)
         self.assert_failed(self.run_setup(), "twice")
+
+    def test_the_previous_program_link_is_replaced_not_followed(self):
+        old = stub(self.top, "1.2.2", "old")
+        self.install.mkdir()
+        self.installed().write_bytes(old)
+        self.installed().chmod(0o755)
+        outside = self.top / "outside"
+        outside.write_bytes(b"keep me")
+        try:
+            (self.install / self.previous).symlink_to(outside)
+        except OSError as error:
+            self.skipTest(f"cannot create a symbolic link here: {error}")
+        self.assert_ok(self.run_setup())
+        self.assertEqual(outside.read_bytes(), b"keep me")
+        self.assertFalse((self.install / self.previous).is_symlink())
+        self.assertEqual((self.install / self.previous).read_bytes(), old)
+        self.assertEqual(self.installed().read_bytes(), self.current)
 
     def test_a_broken_program_is_replaced(self):
         self.install.mkdir()
@@ -516,6 +573,57 @@ class PowerShellSetupTests(SetupTests):
         self.assertIn("Download failed: https://github.com/2742zdz/AITP/releases/latest/download/aitp-manifest.json",
                       result.stderr)
         self.assertEqual(self.mirror.requests, [])
+
+    def install_old_with_running_proxies(self):
+        self.old = stub(self.top, "1.2.2", "old")
+        self.install.mkdir()
+        self.installed().write_bytes(self.old)
+        self.installed().chmod(0o755)
+        for environment in ("claude", "codex"):
+            (self.state / f"active-{environment}").write_bytes(b"")
+
+    def actions(self) -> list[str]:
+        return [" ".join(line[4:] for line in call if line.startswith("arg="))
+                for call in self.calls()]
+
+    def test_running_proxies_are_stopped_and_started_again(self):
+        self.install_old_with_running_proxies()
+        self.assert_ok(self.run_setup())
+        self.assertEqual(self.installed().read_bytes(), self.current)
+        self.assertEqual(self.actions()[:2], ["--environment claude stop", "--environment codex stop"])
+        self.assertTrue(self.actions()[2].startswith("init "))
+        # init starts the Claude proxy; the Codex one is started again.
+        self.assertEqual(self.actions()[3:], ["--environment codex start"])
+        self.assertEqual(sorted(path.name for path in self.state.iterdir()), ["active-claude", "active-codex"])
+
+    def test_a_failed_setup_starts_the_stopped_proxies_again(self):
+        self.install_old_with_running_proxies()
+        environment = self.environment()
+        environment["AITP_STUB_FAIL"] = "init"
+        result = self.run_setup(environment=environment)
+        self.assertNotEqual(result.returncode, 0)
+        self.assertIn("aitp init failed", result.stderr)
+        self.assertNotIn(KEY, result.stdout + result.stderr)
+        self.assertEqual(self.actions()[-2:], ["--environment claude start", "--environment codex start"])
+        self.assertEqual(sorted(path.name for path in self.state.iterdir()), ["active-claude", "active-codex"])
+
+    def test_a_failed_replacement_puts_the_previous_program_back(self):
+        # Move-Replace from the script itself, with a source that cannot be
+        # moved: the old program is moved aside, the move into place fails.
+        self.install.mkdir()
+        self.installed().write_bytes(b"old program")
+        script = HERE / "setup.ps1"
+        result = self.powershell(
+            "$errors = $null; $ast = [Management.Automation.Language.Parser]::ParseFile("
+            f"{self.quote(str(script))}, [ref]$null, [ref]$errors); "
+            "$function = $ast.FindAll({ param($node) $node -is [Management.Automation.Language.FunctionDefinitionAst] "
+            "-and $node.Name -eq 'Move-Replace' }, $true) | Select-Object -First 1; "
+            ". ([scriptblock]::Create($function.Extent.Text)); "
+            f"Move-Replace {self.quote(str(self.install / 'missing.exe'))} {self.quote(str(self.installed()))} -Attempts 2")
+        self.assertNotEqual(result.returncode, 0)
+        self.assertIn("the previous program is still installed", result.stderr)
+        self.assertEqual(self.installed().read_bytes(), b"old program")
+        self.assertEqual(self.leftovers(), [])
 
     def test_parses(self):
         result = self.powershell(

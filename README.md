@@ -38,6 +38,11 @@ Gateway again.
 | `--api-key KEY` | `-ApiKey KEY` | the API key; omitted: asked for without echo |
 | `--install-dir DIR` | `-InstallDir DIR` | another install directory (also `AITP_INSTALL_DIR`) |
 | `--no-start` | `-NoStart` | configure, but do not start the local proxy (`aitp start` later) |
+
+On Windows a running `aitp.exe` cannot be replaced: the installer stops the
+local proxies that run, replaces the program and starts them again (also
+with `-NoStart`, and also when the installation fails). If the replacement
+fails, the previous program stays installed.
 | `--codex` | `-Codex` | also configure Codex (`aitp init-codex`) |
 | `--install-only` | `-InstallOnly` | only install or update the program |
 

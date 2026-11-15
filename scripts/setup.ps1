@@ -56,7 +56,8 @@ Usage: setup.ps1 -BaseUrl URL -ApiKey KEY [options]
   -BaseUrl URL          The Gateway base URL (passed to `aitp init`).
   -ApiKey KEY           The Gateway API key. Omitted: asked for on the console.
   -InstallDir DIR       Install directory (default: %LOCALAPPDATA%\AITP\bin).
-  -NoStart              Configure, but do not start the local proxy.
+  -NoStart              Configure, but do not start the local proxy (a proxy
+                        stopped to replace the program is started again).
   -Codex                Also configure Codex (`aitp init-codex`).
   -InstallOnly          Only install or update the program; configure nothing
                         (-BaseUrl and -ApiKey are then optional).
@@ -196,6 +197,53 @@ function Invoke-Program {
     }
 }
 
+# Whether the local proxy of environment $Product (claude, codex) runs:
+# `aitp --environment <product> status` reports "service active: yes".
+function Test-ProxyActive {
+    param([string]$Path, [string]$Product)
+    try {
+        $startInfo = New-Object Diagnostics.ProcessStartInfo
+        $startInfo.FileName = $Path
+        $startInfo.UseShellExecute = $false
+        $startInfo.RedirectStandardOutput = $true
+        $startInfo.Arguments = "--environment $Product status"
+        $process = [Diagnostics.Process]::Start($startInfo)
+        try {
+            $output = $process.StandardOutput.ReadToEnd()
+            $process.WaitForExit()
+        }
+        finally {
+            $process.Dispose()
+        }
+        return @($output -split "\r?\n") -ccontains "service active: yes"
+    }
+    catch {
+        return $false
+    }
+}
+
+# Starts again the proxies this run stopped ($State.Stopped) that do not run
+# now: after a failure, and after `aitp init` (which starts only its own).
+function Restore-Proxies {
+    if ($State.Stopped.Count -eq 0) { return }
+    $path = $State.Program
+    if (-not (Test-Path -LiteralPath $path -PathType Leaf)) {
+        Write-Setup "warning: the stopped AITP proxies ($($State.Stopped -join ', ')) cannot be started again: $path is missing"
+        return
+    }
+    foreach ($product in $State.Stopped) {
+        if (Test-ProxyActive $path $product) { continue }
+        Write-Setup "starting the AITP local proxy ($product) again"
+        try {
+            $code = Invoke-Program $path @("--environment", $product, "start")
+            if ($code -ne 0) { Write-Setup "warning: aitp --environment $product start exited with $code" }
+        }
+        catch {
+            Write-Setup "warning: could not start the AITP local proxy ($product): $($_.Exception.Message)"
+        }
+    }
+}
+
 # The version an aitp program reports ("aitp X.Y.Z"), or "".
 function Get-ProgramVersion {
     param([string]$Path)
@@ -210,32 +258,60 @@ function Get-ProgramVersion {
 }
 
 # Replaces $Destination with $Source (same directory), retrying while a
-# process that is shutting down still holds the old program.
+# process that is shutting down still holds the old program: the old program
+# is renamed aside, the new one renamed into place; if that fails, the old one
+# is renamed back, so $Destination is never left missing unnoticed.
 function Move-Replace {
-    param([string]$Source, [string]$Destination)
-    $attempts = 120
-    for ($attempt = 1; $attempt -le $attempts; $attempt++) {
+    param([string]$Source, [string]$Destination, [int]$Attempts = 120)
+    for ($attempt = 1; ; $attempt++) {
+        $aside = $null
         try {
             if (Test-Path -LiteralPath $Destination -PathType Leaf) {
-                $backup = Join-Path (Split-Path -Parent $Destination) (".aitp.replace." + [guid]::NewGuid().ToString("N") + ".bak")
-                try {
-                    [IO.File]::Replace($Source, $Destination, $backup, $true)
-                }
-                finally {
-                    Remove-Item -LiteralPath $backup -Force -ErrorAction SilentlyContinue
-                }
+                $aside = Join-Path (Split-Path -Parent $Destination) (".aitp.replace." + [guid]::NewGuid().ToString("N") + ".bak")
+                [IO.File]::Move($Destination, $aside)
             }
-            else {
-                [IO.File]::Move($Source, $Destination)
-            }
-            return
+            [IO.File]::Move($Source, $Destination)
         }
         catch {
-            if ($attempt -eq $attempts) {
-                throw "Could not replace $Destination ($($_.Exception.Message)). Stop AITP (aitp stop) or close programs started by it, then run setup again."
+            $failure = $_.Exception.Message
+            if ($aside -and (Test-Path -LiteralPath $aside -PathType Leaf) -and -not (Test-Path -LiteralPath $Destination)) {
+                try {
+                    [IO.File]::Move($aside, $Destination)
+                }
+                catch {
+                    throw "Could not replace $Destination ($failure), nor put the previous program back ($($_.Exception.Message)): it is at $aside; rename it to $(Split-Path -Leaf $Destination)."
+                }
+            }
+            if ($attempt -ge $Attempts) {
+                $outcome = if (Test-Path -LiteralPath $Destination -PathType Leaf) { "the previous program is still installed" } else { "nothing is installed" }
+                throw "Could not replace $Destination ($failure); $outcome. Stop AITP (aitp stop) or close programs started by it, then run setup again."
             }
             Start-Sleep -Milliseconds 250
+            continue
         }
+        # The old program may still be running (then it stays; uninstall removes it).
+        if ($aside) { Remove-Item -LiteralPath $aside -Force -ErrorAction SilentlyContinue }
+        return
+    }
+}
+
+# Moves $Source to $Destination (aitp-previous.exe), replacing whatever is
+# there without writing through it: a link is removed, not followed. A
+# failure only loses the copy of the previous program.
+function Set-PreviousProgram {
+    param([string]$Source, [string]$Destination)
+    try {
+        # Deleting a file or a link never follows it; a link to a directory
+        # (or an empty directory) goes with Directory.Delete.
+        try { [IO.File]::Delete($Destination) } catch { }
+        if ([IO.Directory]::Exists($Destination)) {
+            try { [IO.Directory]::Delete($Destination, $false) } catch { }
+        }
+        [IO.File]::Move($Source, $Destination)
+    }
+    catch {
+        Write-Setup "warning: could not keep the previous program at $Destination ($($_.Exception.Message))"
+        Remove-Item -LiteralPath $Source -Force -ErrorAction SilentlyContinue
     }
 }
 
@@ -355,7 +431,7 @@ function Install-Aitp {
     $work = Join-Path ([IO.Path]::GetTempPath()) ("aitp-setup-" + [guid]::NewGuid().ToString("N"))
     $null = New-Item -ItemType Directory -Path $work
     $staged = $null
-    $stoppedSeparateCodex = $false
+    $previous = $null
     $progress = $ProgressPreference
     $ProgressPreference = "SilentlyContinue"
     try {
@@ -398,31 +474,32 @@ function Install-Aitp {
                     throw "The downloaded program does not report version $($release.Version); nothing installed."
                 }
 
-                if ($installed) {
-                    # A running proxy holds aitp.exe open: stop the Claude and
-                    # the Codex proxy first (init starts the configured ones
-                    # again with the new program; a separate Codex environment
-                    # (CODEX_HOME) without -Codex is left to the user, below).
-                    # An old program that does not run cannot hold the file
-                    # either: replace it anyway.
-                    $stoppedSeparateCodex = (-not $Codex) -and -not [string]::IsNullOrEmpty($env:CODEX_HOME)
-                    foreach ($product in @("claude", "codex")) {
-                        Write-Setup "stopping the AITP local proxy ($product) before replacing the program"
-                        try {
-                            $code = Invoke-Program $installPath @("--environment", $product, "stop")
-                            if ($code -ne 0) { Write-Setup "warning: aitp stop exited with $code" }
-                        }
-                        catch {
-                            Write-Setup "warning: could not run the installed program ($($_.Exception.Message))"
-                        }
-                    }
-                    [IO.File]::Copy($installPath, $backupPath, $true)
-                }
+                # Everything that can fail on its own happens before any proxy
+                # is stopped: the new program staged, the old one copied.
                 $staged = Join-Path $directory (".aitp.install." + [guid]::NewGuid().ToString("N") + ".exe")
                 [IO.File]::Copy($candidate, $staged, $false)
                 if (-not $OnWindows) { & chmod 0755 $staged }
+                if ($installed) {
+                    $previous = Join-Path $directory (".aitp.install." + [guid]::NewGuid().ToString("N") + ".exe")
+                    [IO.File]::Copy($installPath, $previous, $false)
+                    # A running proxy holds aitp.exe open: stop the ones that
+                    # run (Restore-Proxies starts them again at the end, if
+                    # `aitp init` has not).
+                    $State.Program = $installPath
+                    foreach ($product in @("claude", "codex")) {
+                        if (-not (Test-ProxyActive $installPath $product)) { continue }
+                        Write-Setup "stopping the AITP local proxy ($product) to replace the program"
+                        $null = $State.Stopped.Add($product)
+                        $code = Invoke-Program $installPath @("--environment", $product, "stop")
+                        if ($code -ne 0) { Write-Setup "warning: aitp stop exited with $code" }
+                    }
+                }
                 Move-Replace $staged $installPath
                 $staged = $null
+                if ($previous) {
+                    Set-PreviousProgram $previous $backupPath
+                    $previous = $null
+                }
                 $updated = $true
                 if ($installedVersion) {
                     Write-Setup "updated $installPath from aitp $installedVersion to $($release.Version) (previous program: $backupPath)"
@@ -436,6 +513,7 @@ function Install-Aitp {
     finally {
         $ProgressPreference = $progress
         if ($staged) { Remove-Item -LiteralPath $staged -Force -ErrorAction SilentlyContinue }
+        if ($previous) { Remove-Item -LiteralPath $previous -Force -ErrorAction SilentlyContinue }
         Remove-Item -LiteralPath $work -Recurse -Force -ErrorAction SilentlyContinue
     }
 
@@ -467,13 +545,19 @@ function Install-Aitp {
         Write-Setup "$directory is not on your PATH; add it to run aitp by name"
     }
     if ($NoStart) { Write-Setup "next: start the local proxy with: aitp start" }
-    if ($stoppedSeparateCodex) {
-        Write-Setup "the Codex proxy of CODEX_HOME was stopped for the update; if you use it, start it again: aitp --environment codex start"
-    }
     Write-Setup "next: run Claude Code as usual (claude); it now goes through the AITP local proxy."
     Write-Setup "      (aitp claude also works, and starts the proxy if it is not running.)"
     if ($Codex) { Write-Setup "      For Codex run: aitp codex" }
     Write-Setup "check: aitp doctor    remove: aitp uninstall"
 }
 
-Install-Aitp
+# The proxies this run stopped to replace the program, started again however
+# the run ends (a hashtable: the functions change its contents, never the
+# variable, so nothing leaks into the caller's session).
+$State = @{ Stopped = New-Object Collections.ArrayList; Program = $null }
+try {
+    Install-Aitp
+}
+finally {
+    Restore-Proxies
+}

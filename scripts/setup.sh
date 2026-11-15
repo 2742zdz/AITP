@@ -326,7 +326,9 @@ main() {
         staged="$(mktemp "${install_dir}/.aitp.install.XXXXXX")"
         cp -- "${install_path}" "${staged}"
         chmod 0755 "${staged}"
-        [ ! -L "${backup_path}" ] || die "refusing to replace a symbolic link: ${backup_path}"
+        # Replace the entry itself, never write through a link.
+        [ ! -L "${backup_path}" ] || rm -f -- "${backup_path}"
+        [ ! -d "${backup_path}" ] || die "not a file: ${backup_path}"
         mv -f -- "${staged}" "${backup_path}"
         staged=""
       fi
@@ -371,7 +373,8 @@ main() {
   [ "${on_path}" = 1 ] || aitp_command="${install_path}"
   printf '\n' >&2
   if [ "${on_path}" = 0 ]; then
-    say "${install_dir} is not on your PATH; to run aitp by name, add to your shell profile:"
+    say "${install_dir} is not on your PATH; to run aitp by name, add this line to your shell profile"
+    say "and open a new terminal (or run it now in this one):"
     say "  export PATH=\"${install_dir}:\$PATH\""
   fi
   if [ "${install_only}" = 0 ]; then
