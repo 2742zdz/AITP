@@ -10262,10 +10262,11 @@ mod tests {
     #[test]
     fn windows_stop_skips_a_reused_pid_it_may_not_terminate() {
         let pid = windows_background::tests::protected_process_id();
+        // Not even queryable by this token: no identity to match, so any
+        // record of the PID is stale (covered by the first case below).
         let created = windows_background::Process::open(pid, false)
             .unwrap()
-            .unwrap()
-            .created;
+            .map(|process| process.created);
         let temporary = TempDir::new().unwrap();
         let dir = temporary.path();
         let pid_file = dir.join(WINDOWS_PID_FILENAME.get());
@@ -10279,16 +10280,18 @@ mod tests {
             fs::write(&pid_file, serde_json::to_vec(&state).unwrap()).unwrap();
         };
 
-        write_state(created + 1);
+        write_state(created.map_or(1, |created| created + 1));
         stop_windows_background_proxy_at(dir, false, &[]).unwrap();
         assert!(!pid_file.exists());
 
-        write_state(created);
-        let error = stop_windows_background_proxy_at(dir, false, &[])
-            .unwrap_err()
-            .to_string();
-        assert!(error.contains("higher privileges"), "{error}");
-        assert!(pid_file.exists());
+        if let Some(created) = created {
+            write_state(created);
+            let error = stop_windows_background_proxy_at(dir, false, &[])
+                .unwrap_err()
+                .to_string();
+            assert!(error.contains("higher privileges"), "{error}");
+            assert!(pid_file.exists());
+        }
 
         // Legacy bare PID: the worker check rejects a process that is not ours.
         fs::write(&pid_file, pid.to_string()).unwrap();

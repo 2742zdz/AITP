@@ -50,6 +50,12 @@ impl Process {
     /// or another user's process). When only the requested rights are
     /// refused, the process comes back restricted so callers can still
     /// compare its creation time against the recorded one.
+    ///
+    /// Known limit: a proxy this user cannot even query (started under
+    /// another account sharing the same home) is reported as gone and its
+    /// record dropped. The proxy is started by this user, so that only
+    /// happens under unusual setups, while refusing would block every stop
+    /// after Windows reuses the PID for another user's process.
     pub fn open(pid: u32, terminate: bool) -> Result<Option<Self>> {
         if pid <= 1 {
             bail!("invalid background process ID");
@@ -313,7 +319,8 @@ pub(crate) mod tests {
     }
 
     /// PID of a running csrss.exe: a protected process that even an elevated
-    /// test runner may query but never terminate.
+    /// test runner may not terminate. Whether it may query it depends on the
+    /// runner's token, so tests accept both outcomes.
     pub(crate) fn protected_process_id() -> u32 {
         let output = std::process::Command::new("tasklist")
             .args(["/FI", "IMAGENAME eq csrss.exe", "/FO", "CSV", "/NH"])
@@ -332,7 +339,10 @@ pub(crate) mod tests {
     #[test]
     fn a_process_that_refuses_termination_is_inspected_but_not_stopped() {
         let pid = protected_process_id();
-        let process = Process::open(pid, true).unwrap().unwrap();
+        let Some(process) = Process::open(pid, true).unwrap() else {
+            // Not even queryable by this token: reported as no process of ours.
+            return;
+        };
         assert!(process.restricted);
         assert_ne!(process.created, 0);
         assert!(process.running());
