@@ -7,14 +7,17 @@ name: Release
 # - draft: pushing a vX.Y.Z tag (on main, equal to the package version).
 #   The same build and checks, then a DRAFT release with the six programs
 #   and the unsigned aitp-manifest.json; their digests are recorded.
-#   Nothing is published and nothing is signed: the workflow never holds a
-#   signing key. The maintainer signs the manifest offline and uploads
-#   aitp-manifest.json.minisig to the draft (see README "Releasing").
+#   Nothing is published or signed.
 # - publish: a run by hand on that tag with publish_confirmation set to
 #   "publish <tag>", in the "release" environment (required reviewer).
-#   Checks the draft against the recorded digests and the signature against
-#   the keys built into the program, re-reads the draft and publishes it
-#   (immutable).
+#   Checks the draft against the recorded digests and regenerates the
+#   manifest; signs it with the release key (the environment's secret
+#   AITP_SIGNING_KEY, given to that one step only) unless the draft already
+#   holds a signature (the maintainer's recovery key, signed offline);
+#   verifies the signature against the keys built into the program,
+#   re-reads the draft and publishes it (immutable).
+# Only the publish job can read the signing key: previews, pull requests
+# and tag runs never enter the "release" environment.
 # Pushing a tag alone never publishes anything. The confirmation guards
 # against an accidental publish; the environment's reviewer is the approval.
 on:
@@ -102,6 +105,35 @@ jobs:
             echo "::error::a placeholder signing key switch is named in the repository (git grep: $found)" >&2
             exit 1
           fi
+          # The signing key is read in exactly one place: the env of the
+          # publish job's signing step. Any other mention of workflow
+          # secrets (job env, toJSON, inherit, another step) fails here.
+          # (A text check of the workflow files, not an analysis of what
+          # Actions evaluates.) This guards against mistakes; the boundary
+          # itself is the "release" environment (required reviewer, v* tags
+          # only), which alone holds the secret.
+          python3 -B - <<'PY'
+          import pathlib, re, sys
+          word = "secret" + "s"
+          step = "      - name: Sign the manifest with the release key"
+          expected = "          AITP_SIGNING_KEY: $" + "{{ " + word + ".AITP_SIGNING_KEY }}"
+          hits = []
+          for path in sorted(pathlib.Path(".github").rglob("*")):
+              if path.is_file() and not path.is_symlink() and path.suffix in (".yml", ".yaml"):
+                  lines = path.read_text(encoding="utf-8", errors="replace").splitlines()
+                  hits += [(path, number, lines) for number, line in enumerate(lines)
+                           if re.search(word, line, re.IGNORECASE) and not line.lstrip().startswith("#")]
+          ok = len(hits) == 1
+          if ok:
+              path, number, lines = hits[0]
+              names = [index for index in range(number) if lines[index].startswith("      - ")]
+              ok = (str(path) == ".github/workflows/release.yml" and lines[number] == expected
+                    and bool(names) and lines[names[-1]] == step)
+          if not ok:
+              for path, number, lines in hits:
+                  print(f"{path}:{number + 1}: {lines[number]}", file=sys.stderr)
+              sys.exit("::error::the signing key may be read only by the publish job's signing step")
+          PY
           if [ "$mode" != preview ]; then
             version="$(python3 -B -c 'import sys; sys.path.insert(0, "scripts"); import release_manifest; print(release_manifest.cargo_version())')"
             if [ "$REF_NAME" != "v$version" ]; then
@@ -324,7 +356,7 @@ jobs:
             echo '```'
             cat release-digests.sha256
             echo '```'
-            echo '### Signing (offline)'
+            echo '### Manifest (signed by the publish run)'
             echo '```'
             cat "$RUNNER_TEMP/generate.txt"
             echo '```'
@@ -384,7 +416,7 @@ jobs:
           {
             echo "AITP $TAG."
             echo
-            echo "Draft: the maintainer signs aitp-manifest.json (sha256 $manifest_sha256) offline and adds aitp-manifest.json.minisig before publishing."
+            echo "Draft: aitp-manifest.json (sha256 $manifest_sha256) is signed when the release is published."
           } > "$notes"
           gh release create "$TAG" --repo "$GITHUB_REPOSITORY" --draft --verify-tag \
             --title "AITP $TAG" --notes-file "$notes" \
@@ -414,7 +446,7 @@ jobs:
             fi
             exit 1
           fi
-          echo "::notice::draft of $TAG ready. Sign aitp-manifest.json offline, upload aitp-manifest.json.minisig to the draft, then run: gh workflow run Release --ref $TAG -f publish_confirmation='publish $TAG'"
+          echo "::notice::draft of $TAG ready. Publish (signs the manifest): gh workflow run Release --ref $TAG -f publish_confirmation='publish $TAG'"
 
       - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
         with:
@@ -448,8 +480,8 @@ jobs:
           python-version: '3.12'
 
       # Only the one release of this tag, built by a successful tag run of
-      # this commit, with exactly the six programs, the manifest and its
-      # signature.
+      # this commit, with exactly the six programs and the manifest, and
+      # perhaps a signature (signed offline with the recovery key).
       - name: Download the draft
         id: fetch
         env:
@@ -457,12 +489,12 @@ jobs:
           TAG: ${{ github.ref_name }}
         run: |
           read -r -a assets <<<"$ASSETS"
-          names=(--asset aitp-manifest.json --asset aitp-manifest.json.minisig)
+          names=(--asset aitp-manifest.json)
           for asset in "${assets[@]}"; do names+=(--asset "$asset"); done
           python3 -B scripts/github_release.py fetch --repository "$GITHUB_REPOSITORY" --tag "$TAG" \
             --sha "$GITHUB_SHA" --dist dist --release-json "$RUNNER_TEMP/release.json" \
             --github-output "$GITHUB_OUTPUT" \
-            "${names[@]}"
+            "${names[@]}" --optional-asset aitp-manifest.json.minisig
 
       - name: Download the digests the tag run recorded
         uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4
@@ -473,17 +505,22 @@ jobs:
           github-token: ${{ github.token }}
 
       # The draft holds the files the tag run built and recorded; the
-      # manifest describes exactly them; the signature verifies with a key
-      # built into the program (never a placeholder) and the programs carry
-      # those keys; the programs pass the release checks again.
-      - name: Check the draft and its signature
+      # manifest describes exactly them; the programs pass the release checks
+      # again. Only then is anything signed.
+      - name: Check the draft
         env:
           TAG: ${{ github.ref_name }}
           STATE: ${{ steps.fetch.outputs.state }}
+          OPTIONAL: ${{ steps.fetch.outputs.optional }}
         run: |
           read -r -a assets <<<"$ASSETS"
-          names=(--asset aitp-manifest.json --asset aitp-manifest.json.minisig)
+          names=(--asset aitp-manifest.json)
           for asset in "${assets[@]}"; do names+=(--asset "$asset"); done
+          case "$OPTIONAL" in
+            "") ;;
+            aitp-manifest.json.minisig) names+=(--asset aitp-manifest.json.minisig) ;;
+            *) echo "::error::unexpected optional assets: $OPTIONAL" >&2; exit 1 ;;
+          esac
           if [ "$STATE" != draft ]; then
             echo "::error::the release of $TAG is $STATE, not a draft" >&2
             exit 1
@@ -493,12 +530,44 @@ jobs:
           (cd dist && sha256sum --check --strict "$digests")
           python3 -B scripts/release_manifest.py generate --dist dist --output "$RUNNER_TEMP/aitp-manifest.json" > /dev/null
           cmp "$RUNNER_TEMP/aitp-manifest.json" dist/aitp-manifest.json
-          python3 -B scripts/release_manifest.py verify --manifest dist/aitp-manifest.json --dist dist
           python3 -B scripts/check_asset.py "${assets[@]/#/dist/}"
           python3 -B scripts/check_release.py --build-dir "$GITHUB_WORKSPACE" "${assets[@]/#/dist/}"
           python3 -B scripts/github_release.py verify --dist dist --tag "$TAG" --state draft \
             "${names[@]}" \
             < "$RUNNER_TEMP/release.json"
+
+      - name: Install the signing tool's dependencies
+        if: steps.fetch.outputs.optional == ''
+        run: |
+          python3 -m pip install --disable-pip-version-check --no-deps --only-binary :all: \
+            --require-hashes -r scripts/requirements-signing.txt
+
+      # The only step that sees the release key. The key stays in memory;
+      # the script prints nothing of it.
+      - name: Sign the manifest with the release key
+        if: steps.fetch.outputs.optional == ''
+        env:
+          AITP_SIGNING_KEY: ${{ secrets.AITP_SIGNING_KEY }}
+        run: |
+          python3 -B scripts/sign_manifest.py --manifest dist/aitp-manifest.json \
+            --output dist/aitp-manifest.json.minisig
+
+      - name: Upload the signature to the draft
+        if: steps.fetch.outputs.optional == ''
+        env:
+          GH_TOKEN: ${{ github.token }}
+          RELEASE_ID: ${{ steps.fetch.outputs.id }}
+        run: |
+          [[ "$RELEASE_ID" =~ ^[0-9]+$ ]]
+          gh api --method POST \
+            "https://uploads.github.com/repos/$GITHUB_REPOSITORY/releases/$RELEASE_ID/assets?name=aitp-manifest.json.minisig" \
+            -H "Content-Type: application/octet-stream" --input dist/aitp-manifest.json.minisig > /dev/null
+
+      # The signature (the workflow's or the recovery key's) verifies with a
+      # key built into the program, never a placeholder, and the programs
+      # carry those keys.
+      - name: Verify the signature
+        run: python3 -B scripts/release_manifest.py verify --manifest dist/aitp-manifest.json --dist dist
 
       - name: Publish the immutable release
         env:

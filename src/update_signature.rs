@@ -1,10 +1,11 @@
 //! Signed update manifests of a fixed update source.
 //!
-//! The manifest is signed offline in minisign's legacy format (algorithm
-//! `Ed`: plain Ed25519 over the manifest's exact bytes), so a maintainer
-//! signs with the stock tool (`minisign -S -l …`) and checks the result with
-//! `minisign -V`. The default prehashed format (`ED`, BLAKE2b-512 first) is
-//! refused with a hint; it needs a hash this program does not carry.
+//! The manifest is signed in minisign's legacy format (algorithm `Ed`:
+//! plain Ed25519 over the manifest's exact bytes): by a distribution's
+//! release tooling, or by a maintainer with the stock tool
+//! (`minisign -S -l …`), checked with `minisign -V` either way. The default
+//! prehashed format (`ED`, BLAKE2b-512 first) is refused with a hint; it
+//! needs a hash this program does not carry.
 //!
 //! Wire formats (minisign):
 //! - public key: base64 (56 characters) of `Ed` ‖ key id (8) ‖ Ed25519

@@ -243,7 +243,7 @@ class PrintedCommandTests(unittest.TestCase):
         command = rm.sign_command(Path("/x/aitp-manifest.json"), "1.2.3", digest)
         self.assertEqual(
             command,
-            "minisign -S -l -s aitp-release.key -p aitp-release.pub -m aitp-manifest.json "
+            "minisign -S -l -s aitp-recovery.key -p aitp-recovery.pub -m aitp-manifest.json "
             f"-x aitp-manifest.json.minisig -t 'aitp-manifest 1.2.3 sha256:{digest}'",
         )
         for name in ["release manifest.json", "a'b.json", "$(touch x).json", "a;b.json", "-x.json", "a`b`.json"]:
@@ -321,7 +321,7 @@ class BrandAndReleaseTests(unittest.TestCase):
             manifest = manifest_path.read_bytes()
             digest = hashlib.sha256(manifest).hexdigest()
             self.assertIn(
-                f"minisign -S -l -s aitp-release.key -p aitp-release.pub -m aitp-manifest.json "
+                f"minisign -S -l -s aitp-recovery.key -p aitp-recovery.pub -m aitp-manifest.json "
                 f"-x aitp-manifest.json.minisig -t 'aitp-manifest 1.2.3 sha256:{digest}'",
                 result.stdout,
             )

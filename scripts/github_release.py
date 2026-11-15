@@ -6,12 +6,14 @@
 
   github_release.py fetch --repository OWNER/NAME --tag TAG --sha SHA
                           --dist DIR --release-json FILE --github-output FILE
-                          --asset NAME [--asset NAME ...]
+                          --asset NAME [--asset NAME ...] [--optional-asset NAME ...]
       Only the one release (draft or published) of TAG, and only when a
       successful tag run (event push) of the release workflow built TAG at
-      SHA: downloads exactly the named assets into the new directory DIR,
-      writes the release JSON to FILE and appends id=, state= (draft or
-      published) and run_id= (that tag run) to the GitHub output file.
+      SHA: the release holds exactly the named assets plus any of the
+      optional ones; downloads them into the new directory DIR, writes the
+      release JSON to FILE and appends id=, state= (draft or published),
+      run_id= (that tag run) and optional= (the optional assets present,
+      space-separated) to the GitHub output file.
 
   github_release.py make-latest --tag TAG --latest LATEST
       Prints "true" when TAG's version is higher than that of LATEST, the
@@ -103,7 +105,7 @@ def fetch(args) -> None:
     require(TAG.fullmatch(args.tag) is not None, f"{args.tag!r} is not a vX.Y.Z tag")
     require(SHA.fullmatch(args.sha) is not None, "the commit is not a full SHA")
     require(not args.dist.exists(), f"{args.dist} already exists")
-    names = check_names(args.asset)
+    names = check_names(args.asset + args.optional_asset)[:len(args.asset)]
     pages = json.loads(gh("--paginate", "--slurp",
                           f"repos/{args.repository}/actions/workflows/{Path(WORKFLOW_PATH).name}/runs"
                           f"?event=push&head_sha={args.sha}&per_page=100"))
@@ -123,8 +125,9 @@ def fetch(args) -> None:
     require(len(plan) == len(assets) and all(isinstance(identifier, int) for _, identifier in plan),
             "an asset has no numeric id")
     found = [name for name, _ in plan]
-    require(len(set(found)) == len(found) and sorted(found) == sorted(names),
-            f"the release has assets {found}, expected {sorted(names)}")
+    present = [name for name in args.optional_asset if name in found]
+    require(len(set(found)) == len(found) and sorted(found) == sorted(names + present),
+            f"the release has assets {found}, expected {sorted(names)} and any of {args.optional_asset}")
     args.dist.mkdir(parents=True)
     for name, identifier in plan:
         data = gh("-H", "Accept: application/octet-stream", f"repos/{args.repository}/releases/assets/{identifier}")
@@ -132,7 +135,7 @@ def fetch(args) -> None:
     args.release_json.write_text(json.dumps(release), encoding="utf-8")
     state = "draft" if release["draft"] else "published"
     with args.github_output.open("a", encoding="utf-8") as output:
-        output.write(f"id={release['id']}\nstate={state}\nrun_id={run['id']}\n")
+        output.write(f"id={release['id']}\nstate={state}\nrun_id={run['id']}\noptional={' '.join(present)}\n")
     print(f"fetched the {state} release {release['id']} of {args.tag} ({len(plan)} assets), built by run {run['id']}")
 
 
@@ -197,6 +200,7 @@ def main(argv=None) -> int:
     download.add_argument("--release-json", required=True, type=Path)
     download.add_argument("--github-output", required=True, type=Path)
     download.add_argument("--asset", action="append", required=True)
+    download.add_argument("--optional-asset", action="append", default=[])
     latest = commands.add_parser("make-latest")
     latest.add_argument("--tag", required=True)
     latest.add_argument("--latest", required=True)

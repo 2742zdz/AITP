@@ -3,9 +3,13 @@
 
 from __future__ import annotations
 
+import base64
+import contextlib
 import hashlib
 import importlib.util
+import io
 import json
+import os
 import struct
 import sys
 import tempfile
@@ -24,6 +28,9 @@ def load(name: str):
 
 check_asset = load("check_asset")
 check_release = load("check_release")
+release_manifest = load("release_manifest")
+sign_manifest = load("sign_manifest")
+FIXTURES = SCRIPTS.parent / "tests" / "fixtures" / "minisign"
 github_release = load("github_release")
 
 
@@ -222,6 +229,102 @@ class GithubReleaseTest(unittest.TestCase):
                        {"conclusion": "failure"}, {"path": ".github/workflows/ci.yml"}, {"id": "5"}):
             with self.assertRaises(github_release.CheckError, msg=json.dumps(change)):
                 github_release.tag_run([dict(good, **change)], "v1.2.3", sha)
+
+
+def throwaway_key() -> tuple[bytes, bytes, str]:
+    """(key id, seed, minisign public key line) of a key made for one test."""
+    from cryptography.hazmat.primitives import serialization
+    from cryptography.hazmat.primitives.asymmetric.ed25519 import Ed25519PrivateKey
+
+    private = Ed25519PrivateKey.generate()
+    seed = private.private_bytes(serialization.Encoding.Raw, serialization.PrivateFormat.Raw,
+                                 serialization.NoEncryption())
+    public = private.public_key().public_bytes(serialization.Encoding.Raw, serialization.PublicFormat.Raw)
+    key_id = os.urandom(8)
+    return key_id, seed, base64.b64encode(b"Ed" + key_id + public).decode()
+
+
+class SignManifestTest(unittest.TestCase):
+    manifest = (FIXTURES / "manifest.json").read_bytes()  # distribution ktest, version 9.9.9
+
+    def sign(self, key_id: bytes, seed: bytes, trusted: list[str]) -> bytes:
+        return sign_manifest.sign(self.manifest, key_id, seed, trusted, release_manifest, distribution="ktest")
+
+    def test_the_signature_verifies_like_minisign(self) -> None:
+        key_id, seed, public = throwaway_key()
+        other = throwaway_key()[2]
+        signed = self.sign(key_id, seed, [other, public])
+        self.assertEqual(release_manifest.verify_signature(self.manifest, signed, [public]),
+                         release_manifest.key_id_text(key_id))
+        lines = signed.decode().splitlines()
+        digest = hashlib.sha256(self.manifest).hexdigest()
+        self.assertEqual(lines[2], f"trusted comment: aitp-manifest 9.9.9 sha256:{digest}")
+        self.assertTrue(lines[0].startswith("untrusted comment: "))
+        # Ed25519 is deterministic: the same key signs the same bytes.
+        self.assertEqual(signed, self.sign(key_id, seed, [public]))
+        with self.assertRaisesRegex(release_manifest.CheckError, "does not verify"):
+            release_manifest.verify_signature(self.manifest + b" ", signed, [public])
+        with self.assertRaisesRegex(release_manifest.CheckError, "not trusted"):
+            release_manifest.verify_signature(self.manifest, signed, [other])
+
+    def test_the_fixture_signed_by_the_tool_verifies(self) -> None:
+        # The Rust client verifies the same fixture (update_signature_tests.rs).
+        public = (FIXTURES / "workflow.pub").read_text().splitlines()[1]
+        signed = (FIXTURES / "manifest.workflow.minisig").read_bytes()
+        release_manifest.verify_signature(self.manifest, signed, [public])
+
+    def test_only_a_trusted_key_signs(self) -> None:
+        key_id, seed, public = throwaway_key()
+        other_id, other_seed, other = throwaway_key()
+        with self.assertRaisesRegex(sign_manifest.SignError, "not one the AITP program trusts"):
+            self.sign(key_id, seed, [other])
+        # The right key id with another key's seed.
+        with self.assertRaisesRegex(sign_manifest.SignError, "not one the AITP program trusts"):
+            self.sign(key_id, other_seed, [public])
+
+    def run_main(self, value: str | None, output: Path, manifest: Path) -> tuple[int, str]:
+        environ = {} if value is None else {"AITP_SIGNING_KEY": value}
+        errors = io.StringIO()
+        with contextlib.redirect_stderr(errors), contextlib.redirect_stdout(io.StringIO()):
+            status = sign_manifest.main(["--manifest", str(manifest), "--output", str(output)], environ)
+        self.assertNotIn("AITP_SIGNING_KEY", environ, "the key variable is removed once read")
+        return status, errors.getvalue()
+
+    def test_bad_keys_fail_without_showing_them(self) -> None:
+        key_id, seed, _ = throwaway_key()
+        good = base64.b64encode(key_id + seed).decode()
+        with tempfile.TemporaryDirectory() as directory:
+            manifest = Path(directory) / "aitp-manifest.json"
+            manifest.write_bytes(self.manifest)
+            output = Path(directory) / "aitp-manifest.json.minisig"
+            for value, message in (
+                (None, "not set or empty"),
+                ("", "not set or empty"),
+                ("not base64 at all!" + good[:20], "not base64"),
+                (base64.b64encode(key_id + seed[:31]).decode(), "not 40 bytes"),
+                (good.rstrip("="), "not base64"),
+                # 40 bytes end in "X==" where X carries 4 unused bits: set one.
+                (good[:-3] + chr(ord(good[-3]) + 1) + "==", "not canonical base64"),
+                # A real key the brand does not trust.
+                (good, "not one the AITP program trusts"),
+            ):
+                status, errors = self.run_main(value, output, manifest)
+                self.assertEqual(status, 1, value)
+                self.assertIn(message, errors)
+                self.assertFalse(output.exists())
+                for secret in filter(None, (value, good, seed.hex(), base64.b64encode(seed).decode())):
+                    self.assertNotIn(secret, errors)
+
+    def test_an_existing_signature_is_not_overwritten(self) -> None:
+        key_id, seed, _ = throwaway_key()
+        with tempfile.TemporaryDirectory() as directory:
+            output = Path(directory) / "aitp-manifest.json.minisig"
+            output.write_bytes(b"kept")
+            status, errors = self.run_main(base64.b64encode(key_id + seed).decode(), output,
+                                           FIXTURES / "manifest.json")
+            self.assertEqual(status, 1)
+            self.assertIn("already exists", errors)
+            self.assertEqual(output.read_bytes(), b"kept")
 
 
 if __name__ == "__main__":

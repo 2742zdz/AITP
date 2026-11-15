@@ -65,13 +65,14 @@ pub static AITP_BRAND: Brand = Brand {
                 "objects.githubusercontent.com",
             ],
             distribution: "aitp",
-            // The maintainer's minisign public keys (the private keys are kept
-            // offline): primary (aitp-release.pub, key id F7823EF82178E6E0)
-            // and recovery (aitp-recovery.pub, key id 30D8EBD4CDEAE8F0).
-            // Changing them strands every installed copy that trusts only the
-            // old ones.
+            // The minisign public keys: release (key id 7B8244A1E282487E;
+            // its private key is held only by the release workflow, as a
+            // secret of the protected "release" environment) and recovery
+            // (aitp-recovery.pub, key id 30D8EBD4CDEAE8F0; its private key
+            // is kept offline by the maintainer). Changing them strands every
+            // installed copy that trusts only the old ones.
             signing_keys: &[
-                "RWTg5ngh+D6C99dBN+56y4B/nIF4hSSNbCG86wuZr4Knpg+Lc4KxnAgr",
+                "RWR+SILioUSCe02FjXoH9VHY/swzxXGRUmz3ixLge+R1Q9YhspEvMs8A",
                 "RWTw6OrN1OvYMNRnHzX9mhZugihDvcDXMqqpCGfKAIOxZwUnQU1sba/L",
             ],
         }),
@@ -204,7 +205,7 @@ mod tests {
         assert_eq!(
             fixed.signing_keys,
             [
-                "RWTg5ngh+D6C99dBN+56y4B/nIF4hSSNbCG86wuZr4Knpg+Lc4KxnAgr",
+                "RWR+SILioUSCe02FjXoH9VHY/swzxXGRUmz3ixLge+R1Q9YhspEvMs8A",
                 "RWTw6OrN1OvYMNRnHzX9mhZugihDvcDXMqqpCGfKAIOxZwUnQU1sba/L",
             ]
         );
