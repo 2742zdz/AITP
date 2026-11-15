@@ -282,6 +282,11 @@ function Read-Manifest {
     if (-not $match.Success) {
         throw "The manifest is not an AITP release manifest (schema 1, distribution aitp)."
     }
+    # Every asset name once (as the release tools and the program require).
+    $names = New-Object 'Collections.Generic.HashSet[string]' ([StringComparer]::Ordinal)
+    foreach ($name in [regex]::Matches($text, '[{,]"([A-Za-z0-9][A-Za-z0-9._-]*)":\{"sha256"')) {
+        if (-not $names.Add($name.Groups[1].Value)) { throw "The manifest lists $($name.Groups[1].Value) twice." }
+    }
     $version = [regex]::Match($text, ',"version":"([^"]*)"\}\n\z').Groups[1].Value
     $found = [regex]::Matches($text, '[{,]"' + [regex]::Escape($Asset) + '":' + $EntryPattern)
     if ($found.Count -ne 1) {
@@ -350,6 +355,7 @@ function Install-Aitp {
     $work = Join-Path ([IO.Path]::GetTempPath()) ("aitp-setup-" + [guid]::NewGuid().ToString("N"))
     $null = New-Item -ItemType Directory -Path $work
     $staged = $null
+    $stoppedSeparateCodex = $false
     $progress = $ProgressPreference
     $ProgressPreference = "SilentlyContinue"
     try {
@@ -393,14 +399,22 @@ function Install-Aitp {
                 }
 
                 if ($installed) {
-                    # A running proxy holds aitp.exe open: stop it first (init
-                    # starts it again with the new program).
-                    $products = @("claude")
-                    if ($Codex) { $products += "codex" }
-                    foreach ($product in $products) {
+                    # A running proxy holds aitp.exe open: stop the Claude and
+                    # the Codex proxy first (init starts the configured ones
+                    # again with the new program; a separate Codex environment
+                    # (CODEX_HOME) without -Codex is left to the user, below).
+                    # An old program that does not run cannot hold the file
+                    # either: replace it anyway.
+                    $stoppedSeparateCodex = (-not $Codex) -and -not [string]::IsNullOrEmpty($env:CODEX_HOME)
+                    foreach ($product in @("claude", "codex")) {
                         Write-Setup "stopping the AITP local proxy ($product) before replacing the program"
-                        $code = Invoke-Program $installPath @("--environment", $product, "stop")
-                        if ($code -ne 0) { Write-Setup "warning: aitp stop exited with $code" }
+                        try {
+                            $code = Invoke-Program $installPath @("--environment", $product, "stop")
+                            if ($code -ne 0) { Write-Setup "warning: aitp stop exited with $code" }
+                        }
+                        catch {
+                            Write-Setup "warning: could not run the installed program ($($_.Exception.Message))"
+                        }
                     }
                     [IO.File]::Copy($installPath, $backupPath, $true)
                 }
@@ -453,6 +467,9 @@ function Install-Aitp {
         Write-Setup "$directory is not on your PATH; add it to run aitp by name"
     }
     if ($NoStart) { Write-Setup "next: start the local proxy with: aitp start" }
+    if ($stoppedSeparateCodex) {
+        Write-Setup "the Codex proxy of CODEX_HOME was stopped for the update; if you use it, start it again: aitp --environment codex start"
+    }
     Write-Setup "next: run Claude Code as usual (claude); it now goes through the AITP local proxy."
     Write-Setup "      (aitp claude also works, and starts the proxy if it is not running.)"
     if ($Codex) { Write-Setup "      For Codex run: aitp codex" }

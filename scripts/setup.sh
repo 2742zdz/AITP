@@ -176,6 +176,9 @@ read_manifest() {
   entries="\"${ASSET_NAME_PATTERN}\":${ENTRY_PATTERN}"
   grep -Eqx "\\{\"assets\":\\{${entries}(,${entries})*\\},\"distribution\":\"aitp\",\"manifest_schema\":1,\"version\":\"${VERSION_PATTERN}\"\\}" "${manifest}" ||
     die "the manifest is not an AITP release manifest (schema 1, distribution aitp)"
+  # Every asset name once (as the release tools and the program require).
+  [ -z "$(grep -Eo "[{,]\"${ASSET_NAME_PATTERN}\":\\{\"sha256\"" "${manifest}" | cut -c2- | sort | uniq -d)" ] ||
+    die "the manifest lists an asset twice"
   release_version="$(sed -E 's/^.*,"version":"([^"]*)"\}$/\1/' "${manifest}")"
   entry="$(grep -Eo "[{,]\"${asset}\":${ENTRY_PATTERN}" "${manifest}" || true)"
   count="$(printf '%s' "${entry}" | grep -c . || true)"
@@ -301,6 +304,7 @@ main() {
   local updated=0 installed_version=""
   if [ -f "${install_path}" ] && [ "$(sha256_file "${install_path}")" = "${expected_sha256}" ]; then
     say "aitp ${release_version} is already installed at ${install_path}; download skipped"
+    [ -x "${install_path}" ] || chmod 0755 "${install_path}"
   else
     if [ -f "${install_path}" ] && [ -x "${install_path}" ]; then
       installed_version="$(program_version "${install_path}")"

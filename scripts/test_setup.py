@@ -340,6 +340,19 @@ class SetupTests:
             self.assert_failed(self.run_setup(), "aitp-setup:")
         self.mirror.publish(self.files, canonical(small))
         self.assert_failed(self.run_setup(), "not between")
+        # Another asset listed twice (the program's own asset only once).
+        installer = json.dumps(entry(b"x")).replace(" ", "").encode()
+        twice = canonical(good).replace(b'"assets":{', b'"assets":{"setup.sh":' + installer + b',"setup.sh":' + installer + b",")
+        self.mirror.publish(self.files, twice)
+        self.assert_failed(self.run_setup(), "twice")
+
+    def test_a_broken_program_is_replaced(self):
+        self.install.mkdir()
+        self.installed().write_bytes(b"\0" * 4096)
+        self.installed().chmod(0o755)
+        self.assert_ok(self.run_setup())
+        self.assertEqual(self.installed().read_bytes(), self.current)
+        self.assertEqual(self.calls()[-1], self.init_call("1", ""))
 
     def test_an_older_program_is_replaced_and_kept_as_previous(self):
         old = stub(self.top, "1.2.2", "old")
@@ -420,6 +433,14 @@ class BashSetupTests(SetupTests, unittest.TestCase):
     def test_the_key_is_asked_for_without_a_terminal_fails(self):
         result = self.run_setup(key=None)
         self.assert_failed(result, "--api-key is required")
+
+    def test_a_current_program_without_execute_permission_is_fixed(self):
+        self.install.mkdir()
+        self.installed().write_bytes(self.current)
+        self.installed().chmod(0o644)
+        self.assert_ok(self.run_setup())
+        self.assertTrue(os.access(self.installed(), os.X_OK))
+        self.assertEqual(self.calls(), [self.init_call("0", "")])
 
 
 def powershells() -> list[str]:
