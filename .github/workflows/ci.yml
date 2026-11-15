@@ -72,6 +72,13 @@ jobs:
           python3 scripts/test_release_tools.py
           node --test scripts/test_vscode_certificates.js
 
+      # The site (site/): the setup command generator, and the check that
+      # copies a release's installers into it.
+      - name: Test the site
+        run: |
+          node scripts/test_site.js
+          python3 scripts/test_pages_installers.py
+
       # The installers against a fake release server: setup.sh under bash,
       # setup.ps1 under PowerShell 7 (pwsh).
       - name: Test the installers

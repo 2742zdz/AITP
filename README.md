@@ -8,6 +8,15 @@ it installs, and `aitp uninstall` removes them again.
 
 ## Install
 
+[aitp.lol](https://aitp.lol) generates the command below for your Gateway
+and key (bash, PowerShell or cmd), in the browser: it sends nothing and
+stores no key (it remembers the Gateway URL and the language). Its `https://aitp.lol/setup.sh` and `https://aitp.lol/setup.ps1`
+are copies of the installers of the release that was the latest when the
+site was last built (each successful publish run deploys it again), taken
+only after the release manifest's signature verifies with the keys built
+into the program and both match the manifest (`.github/workflows/pages.yml`). The GitHub URLs
+below keep working.
+
 Linux and macOS (bash; x86_64 and arm64):
 
 ```sh
@@ -64,8 +73,10 @@ asked for it instead).
 **Trust.** The installer trusts what it downloads because it comes over
 HTTPS from GitHub; it checks the program against the manifest, but does not
 verify the manifest's minisign signature itself. `aitp update` does (see
-below). To check a release by hand before installing, see "To check the
-keys yourself".
+below). The copies on aitp.lol were checked against the signed manifest
+when they were published, but reach you over HTTPS from GitHub Pages under
+that domain, so you also trust the domain's DNS. To check a release by hand
+before installing, see "To check the keys yourself".
 
 To remove AITP (services, settings, data and the program):
 

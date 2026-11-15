@@ -1,0 +1,118 @@
+name: Pages
+
+# The site https://aitp.lol: the setup command generator (site/) and copies
+# of the latest release's installers (setup.sh, setup.ps1). The installers
+# are taken from the latest published release only after its manifest's
+# signature verifies with a key built into the program and both match the
+# manifest (scripts/pages_installers.py); otherwise nothing is deployed.
+#
+# Runs when the site changes on main, by hand, and after every successful
+# run of the Release workflow started by hand (a publish run; a preview run
+# by hand only redeploys the same latest release).
+on:
+  push:
+    branches: [main]
+    paths:
+      - 'site/**'
+      - 'scripts/pages_installers.py'
+      - 'scripts/release_manifest.py'
+      - 'scripts/test_site.js'
+      - 'src/bin/aitp/brand.rs'
+      - '.github/workflows/pages.yml'
+  workflow_dispatch:
+  workflow_run:
+    workflows: [Release]
+    types: [completed]
+
+permissions:
+  contents: read
+
+# Every run block under bash -eo pipefail.
+defaults:
+  run:
+    shell: bash
+
+# One deployment at a time; a running one is never cancelled. A run that
+# will not deploy (not on main, or after a Release run that is not a
+# successful run by hand, e.g. a pull request preview) gets a group of its
+# own, so it cannot take the place of a deployment waiting in the queue.
+concurrency:
+  group: >-
+    ${{ (github.ref != 'refs/heads/main' ||
+         (github.event_name == 'workflow_run' &&
+          (github.event.workflow_run.conclusion != 'success' ||
+           github.event.workflow_run.event != 'workflow_dispatch'))) &&
+        format('pages-skip-{0}', github.run_id) || 'pages' }}
+  cancel-in-progress: false
+
+jobs:
+  build:
+    name: Build the site
+    # Only main is deployed; after Release, only a successful run by hand.
+    if: >-
+      github.ref == 'refs/heads/main' &&
+      (github.event_name != 'workflow_run' ||
+       (github.event.workflow_run.conclusion == 'success' &&
+        github.event.workflow_run.event == 'workflow_dispatch'))
+    runs-on: ubuntu-22.04
+    timeout-minutes: 10
+    permissions:
+      contents: read
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      - uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97 # v7.0.0
+        with:
+          python-version: '3.12'
+
+      - name: Test the command generator
+        run: node scripts/test_site.js
+
+      # The latest release (the one the installers themselves install from),
+      # by its tag, so that a release published meanwhile cannot mix in.
+      - name: Download the latest release's installers
+        id: release
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          tag="$(gh api "repos/$GITHUB_REPOSITORY/releases/latest" --jq .tag_name)"
+          if ! [[ "$tag" =~ ^v[0-9]+\.[0-9]+\.[0-9]+$ ]]; then
+            echo "::error::unexpected latest release tag: $tag" >&2
+            exit 1
+          fi
+          mkdir "$RUNNER_TEMP/release"
+          gh release download "$tag" --repo "$GITHUB_REPOSITORY" --dir "$RUNNER_TEMP/release" \
+            --pattern aitp-manifest.json --pattern aitp-manifest.json.minisig \
+            --pattern setup.sh --pattern setup.ps1
+          echo "tag=$tag" >> "$GITHUB_OUTPUT"
+
+      - name: Check the installers and build the site
+        env:
+          TAG: ${{ steps.release.outputs.tag }}
+        run: |
+          site="$RUNNER_TEMP/site"
+          cp -R site "$site"
+          python3 -B scripts/pages_installers.py --release "$RUNNER_TEMP/release" --output "$site" --tag "$TAG"
+          (cd "$site" && sha256sum setup.sh setup.ps1) | tee -a "$GITHUB_STEP_SUMMARY"
+          echo "Installers of $TAG." >> "$GITHUB_STEP_SUMMARY"
+
+      - uses: actions/upload-pages-artifact@fc324d3547104276b827a68afc52ff2a11cc49c9 # v5.0.0
+        with:
+          path: ${{ runner.temp }}/site
+
+  deploy:
+    name: Deploy
+    needs: build
+    runs-on: ubuntu-22.04
+    timeout-minutes: 10
+    permissions:
+      pages: write
+      id-token: write
+    environment:
+      name: github-pages
+      url: ${{ steps.deployment.outputs.page_url }}
+    steps:
+      - id: deployment
+        uses: actions/deploy-pages@368f82528645a54fb793d4d04e342629a3f51346 # v5.0.1

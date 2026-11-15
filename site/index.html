@@ -1,0 +1,136 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta http-equiv="Content-Security-Policy" content="default-src 'none'; script-src 'self'; style-src 'self'; img-src 'self' data:; base-uri 'none'; form-action 'none'">
+<meta name="referrer" content="no-referrer">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<meta name="color-scheme" content="light dark">
+<meta name="description" content="AITP: a local proxy for Claude Code and Codex. Generate the one-line setup command.">
+<title>AITP - one-line setup</title>
+<link rel="icon" href="favicon.svg" type="image/svg+xml">
+<link rel="stylesheet" href="style.css">
+<script src="app.js" defer></script>
+</head>
+<body>
+<header class="top">
+  <div class="wrap top-row">
+    <a class="brand" href="./" aria-label="AITP">
+      <img src="favicon.svg" alt="" width="28" height="28">
+      <span>AITP</span>
+    </a>
+    <nav class="top-links">
+      <a href="https://github.com/2742zdz/AITP" rel="noopener noreferrer">GitHub</a>
+      <button type="button" id="lang" class="link-button">中文</button>
+    </nav>
+  </div>
+</header>
+
+<main class="wrap">
+  <section class="intro">
+    <p class="tagline" data-i18n="tagline">A local proxy for Claude Code and Codex.</p>
+    <h1 data-i18n="heading">Generate your one-line setup command</h1>
+    <p class="lead" data-i18n="intro">Enter your Gateway and API key; AITP is installed from its latest signed release and configured in one step.</p>
+  </section>
+
+  <section class="card" aria-labelledby="inputs-title">
+    <h2 id="inputs-title" class="visually-hidden" data-i18n="options">Options</h2>
+
+    <div class="field">
+      <label for="base-url" data-i18n="baseUrl">Gateway base URL</label>
+      <input id="base-url" type="url" inputmode="url" autocomplete="off" autocapitalize="off" spellcheck="false"
+        placeholder="https://gateway.example.com" aria-describedby="base-url-hint url-from-link url-error url-warning url-warning-2">
+      <p id="base-url-hint" class="hint" data-i18n="baseUrlHint">The address your Gateway gives you, e.g. https://gateway.example.com</p>
+      <p id="url-from-link" class="message warning" hidden></p>
+      <p id="url-error" class="message error" role="alert" hidden></p>
+      <p id="url-warning" class="message warning" hidden></p>
+      <p id="url-warning-2" class="message warning" hidden></p>
+    </div>
+
+    <div class="field">
+      <label for="api-key" data-i18n="apiKey">API key</label>
+      <div class="input-row">
+        <input id="api-key" type="password" autocomplete="off" autocapitalize="off" spellcheck="false"
+          data-1p-ignore data-lpignore="true" aria-describedby="api-key-hint key-error">
+        <button type="button" id="key-toggle" class="ghost" aria-pressed="false" aria-controls="api-key">Show</button>
+      </div>
+      <p id="api-key-hint" class="hint" data-i18n="apiKeyHint">Optional. Leave it empty and the installer asks for it without echo, so it stays out of your shell history.</p>
+      <p id="key-error" class="message error" role="alert" hidden></p>
+    </div>
+
+    <fieldset class="options">
+      <legend data-i18n="options">Options</legend>
+      <label class="check"><input type="checkbox" id="opt-codex"> <span data-i18n="codex">Also configure Codex</span></label>
+      <label class="check"><input type="checkbox" id="opt-no-start"> <span data-i18n="noStart">Do not start the local proxy yet</span></label>
+      <label class="check"><input type="checkbox" id="opt-github"> <span data-i18n="github">Download the installer from GitHub instead of aitp.lol</span></label>
+    </fieldset>
+  </section>
+
+  <section class="card output" aria-labelledby="shell-title">
+    <h2 id="shell-title" class="section-title" data-i18n="shellLabel">Your system</h2>
+    <div class="tabs" role="tablist" aria-labelledby="shell-title">
+      <button type="button" role="tab" id="tab-bash" aria-controls="panel" aria-selected="true" data-i18n="bash">macOS / Linux</button>
+      <button type="button" role="tab" id="tab-powershell" aria-controls="panel" aria-selected="false" tabindex="-1" data-i18n="powershell">Windows PowerShell</button>
+      <button type="button" role="tab" id="tab-cmd" aria-controls="panel" aria-selected="false" tabindex="-1" data-i18n="cmd">Windows cmd</button>
+    </div>
+    <div id="panel" role="tabpanel" aria-labelledby="tab-bash" tabindex="0">
+      <p id="shell-where" class="hint">Paste into Terminal.</p>
+      <div class="command-box">
+        <pre hidden><code id="command"></code></pre>
+        <p id="command-status" class="status" aria-live="polite">Enter the Gateway base URL to see the command.</p>
+        <div class="command-actions">
+          <span id="copy-status" class="copy-status" aria-live="polite"></span>
+          <button type="button" id="copy" class="primary" disabled data-i18n="copy">Copy</button>
+        </div>
+      </div>
+      <p id="key-note" class="hint" hidden></p>
+    </div>
+  </section>
+
+  <section class="card steps">
+    <h2 class="section-title" data-i18n="afterTitle">Afterwards</h2>
+    <p data-i18n="afterClaude">Run Claude Code as usual; it now goes through the local proxy:</p>
+    <div class="mini">
+      <code>claude</code>
+      <span id="copy-claude-status" class="copy-status" aria-live="polite"></span>
+      <button type="button" class="ghost small" data-copy="claude" data-status="copy-claude-status" data-i18n="copy">Copy</button>
+    </div>
+    <div id="after-codex" hidden>
+      <p data-i18n="afterCodex">Codex goes through the proxy with:</p>
+      <div class="mini">
+        <code>aitp codex</code>
+        <span id="copy-codex-status" class="copy-status" aria-live="polite"></span>
+        <button type="button" class="ghost small" data-copy="aitp codex" data-status="copy-codex-status" data-i18n="copy">Copy</button>
+      </div>
+    </div>
+    <div id="after-start" hidden>
+      <p data-i18n="afterStart">Start the proxy later with:</p>
+      <div class="mini">
+        <code>aitp start</code>
+        <span id="copy-start-status" class="copy-status" aria-live="polite"></span>
+        <button type="button" class="ghost small" data-copy="aitp start" data-status="copy-start-status" data-i18n="copy">Copy</button>
+      </div>
+    </div>
+
+    <h2 class="section-title" data-i18n="uninstallTitle">Uninstall</h2>
+    <p data-i18n="uninstallText">Removes the services, settings, data and the program AITP installed:</p>
+    <div class="mini">
+      <code>aitp uninstall</code>
+      <span id="copy-uninstall-status" class="copy-status" aria-live="polite"></span>
+      <button type="button" class="ghost small" data-copy="aitp uninstall" data-status="copy-uninstall-status" data-i18n="copy">Copy</button>
+    </div>
+  </section>
+
+  <section class="privacy">
+    <h2 class="section-title" data-i18n="privacyTitle">Your key stays here</h2>
+    <p data-i18n="privacyText">This page builds the command in your browser. It sends nothing anywhere, stores no key and loads nothing from other sites.</p>
+    <p><a href="https://github.com/2742zdz/AITP#install" rel="noopener noreferrer" data-i18n="trustText">How the installer and updates are checked</a></p>
+  </section>
+</main>
+
+<footer class="wrap foot">
+  <a href="https://github.com/2742zdz/AITP" rel="noopener noreferrer" data-i18n="repo">Source on GitHub</a>
+  <span>MIT</span>
+</footer>
+</body>
+</html>
