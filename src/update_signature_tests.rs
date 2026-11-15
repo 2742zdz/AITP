@@ -122,6 +122,37 @@ fn fixture_key(file: &str) -> String {
     lines[1].to_string()
 }
 
+/// A signature written by the release workflow's signing tool
+/// (scripts/sign_manifest.py, with a throwaway key whose secret was
+/// discarded) over the same manifest verifies like minisign's own.
+#[test]
+fn the_release_workflow_signature_verifies() {
+    let file = fixture_text("workflow.pub");
+    let key = fixture_key(file.as_str());
+    let id = file.lines().next().unwrap().rsplit(' ').next().unwrap();
+    let manifest = fixture("manifest.json");
+    let signed = fixture("manifest.workflow.minisig");
+    assert_eq!(
+        check(&manifest, &signed, std::slice::from_ref(&key)).unwrap(),
+        id
+    );
+    let mut changed = manifest.clone();
+    changed.pop();
+    refused(
+        &changed,
+        &signed,
+        std::slice::from_ref(&key),
+        "does not verify",
+    );
+    let primary = fixture_key(fixture_text("primary.pub").as_str());
+    refused(
+        &manifest,
+        &signed,
+        std::slice::from_ref(&primary),
+        "which this program does not trust",
+    );
+}
+
 #[test]
 fn minisign_signatures_verify_and_name_their_key() {
     let fixture_primary = fixture_text("primary.pub");

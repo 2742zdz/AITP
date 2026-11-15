@@ -1,14 +1,15 @@
 #!/usr/bin/env python3
-"""AITP release manifest: generate it unsigned, check its offline signature.
+"""AITP release manifest: generate it unsigned, check its signature.
 
-The maintainer signs the manifest offline with minisign (0.10 or later) in
-its legacy Ed25519 format, the only one the program accepts:
+The release workflow signs the manifest with the release key
+(sign_manifest.py). The maintainer can sign it offline instead, with the
+recovery key and minisign (0.10 or later), in its legacy Ed25519 format,
+the only one the program accepts:
 
-  minisign -S -l -s aitp-release.key -p aitp-release.pub -m aitp-manifest.json \
+  minisign -S -l -s aitp-recovery.key -p aitp-recovery.pub -m aitp-manifest.json \
       -x aitp-manifest.json.minisig -t "aitp-manifest X.Y.Z sha256:<manifest sha256>"
 
-(`generate` prints this command with the values filled in; the recovery key
-signs the same way with aitp-recovery.key / aitp-recovery.pub.)
+(`generate` prints this command with the values filled in.)
 
   release_manifest.py generate --dist DIR [--version X.Y.Z] [--output FILE]
       Writes aitp-manifest.json (canonical JSON) for the release assets in DIR
@@ -417,7 +418,7 @@ def cargo_version() -> str:
 SAFE_NAME = re.compile(r"[A-Za-z0-9][A-Za-z0-9._-]*")
 
 
-def sign_command(manifest: Path, version: str, digest: str, key: str = "aitp-release") -> str:
+def sign_command(manifest: Path, version: str, digest: str, key: str = "aitp-recovery") -> str:
     """The minisign command for the signing machine (POSIX shell quoting;
     with a safe manifest name only the trusted comment is quoted, in single
     quotes, which PowerShell reads the same way)."""
@@ -454,7 +455,8 @@ def command_generate(args) -> int:
     output.write_bytes(rendered)
     digest = hashlib.sha256(rendered).hexdigest()
     print(f"wrote {output} ({len(rendered)} bytes, sha256 {digest})")
-    print("Sign it on the offline signing machine, in the directory holding the key and the manifest")
+    print("The release workflow signs it with the release key. To sign it with the recovery key instead,")
+    print("on the offline signing machine, in the directory holding the key and the manifest")
     print("(POSIX shell or PowerShell):")
     print(f"  {sign_command(output, version, digest)}")
     print("Then copy back only the signature file; check it before upload with (POSIX shell):")

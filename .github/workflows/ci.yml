@@ -59,6 +59,13 @@ jobs:
       - name: Test the aitp program with the contract entries
         run: cargo test --locked --features contract --bin aitp
 
+      # The signing tool's tests sign with throwaway keys (never the
+      # release key, which only the release workflow's publish job reads).
+      - name: Install the signing tool's dependencies
+        run: |
+          python3 -m pip install --disable-pip-version-check --no-deps --only-binary :all: \
+            --require-hashes -r scripts/requirements-signing.txt
+
       - name: Test the release tools and the VSCode certificate helper
         run: |
           python3 scripts/test_release_manifest.py
