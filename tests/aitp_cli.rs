@@ -171,37 +171,32 @@ impl Sandbox {
         let log = self.root.join(format!("run-{}.log", std::process::id()));
         let file = std::fs::File::create(&log).unwrap();
         command.stdout(file.try_clone().unwrap()).stderr(file);
-        // A test running in parallel may fork while another sandbox's copy
-        // of the program is still open for writing ("text file busy").
-        let mut attempts = 0;
-        let mut child = loop {
-            match command.spawn() {
-                Ok(child) => break child,
-                Err(error)
-                    if error.kind() == std::io::ErrorKind::ExecutableFileBusy && attempts < 50 =>
-                {
-                    attempts += 1;
-                    std::thread::sleep(Duration::from_millis(20));
-                }
-                Err(error) => panic!("{command:?}: {error}"),
-            }
-        };
-        let deadline = Instant::now() + Duration::from_secs(120);
-        let status = loop {
-            if let Some(status) = child.try_wait().unwrap() {
-                break status;
-            }
-            if Instant::now() >= deadline {
-                let _ = child.kill();
-                let _ = child.wait();
-                panic!("{command:?} did not finish within 120 s");
-            }
-            std::thread::sleep(Duration::from_millis(20));
-        };
+        let status = wait_bounded(command);
         let text = String::from_utf8_lossy(&std::fs::read(&log).unwrap()).into_owned();
         std::fs::remove_file(&log).unwrap();
         self.printed.lock().unwrap().push(text.clone());
         (status.success(), text)
+    }
+
+    /// Like `output`, with standard output and standard error apart.
+    fn output_split(&self, command: &mut Command) -> (bool, String, String) {
+        let read = |path: &Path| {
+            let text = String::from_utf8_lossy(&std::fs::read(path).unwrap()).into_owned();
+            std::fs::remove_file(path).unwrap();
+            text
+        };
+        let out = self.root.join(format!("run-{}.out", std::process::id()));
+        let err = self.root.join(format!("run-{}.err", std::process::id()));
+        command
+            .stdout(std::fs::File::create(&out).unwrap())
+            .stderr(std::fs::File::create(&err).unwrap());
+        let status = wait_bounded(command);
+        let (stdout, stderr) = (read(&out), read(&err));
+        self.printed
+            .lock()
+            .unwrap()
+            .push(format!("{stdout}{stderr}"));
+        (status.success(), stdout, stderr)
     }
 
     fn run(&self, args: &[&str]) -> String {
@@ -366,6 +361,37 @@ fn canonical(path: &Path) -> PathBuf {
         }
     }
     path
+}
+
+/// Spawns `command` and waits for it (at most 120 s).
+fn wait_bounded(command: &mut Command) -> std::process::ExitStatus {
+    // A test running in parallel may fork while another sandbox's copy
+    // of the program is still open for writing ("text file busy").
+    let mut attempts = 0;
+    let mut child = loop {
+        match command.spawn() {
+            Ok(child) => break child,
+            Err(error)
+                if error.kind() == std::io::ErrorKind::ExecutableFileBusy && attempts < 50 =>
+            {
+                attempts += 1;
+                std::thread::sleep(Duration::from_millis(20));
+            }
+            Err(error) => panic!("{command:?}: {error}"),
+        }
+    };
+    let deadline = Instant::now() + Duration::from_secs(120);
+    loop {
+        if let Some(status) = child.try_wait().unwrap() {
+            break status;
+        }
+        if Instant::now() >= deadline {
+            let _ = child.kill();
+            let _ = child.wait();
+            panic!("{command:?} did not finish within 120 s");
+        }
+        std::thread::sleep(Duration::from_millis(20));
+    }
 }
 
 fn read_json(path: &Path) -> serde_json::Value {
@@ -750,10 +776,96 @@ fn snapshot(path: &Path) -> Vec<u8> {
     std::fs::read(path).unwrap()
 }
 
-/// aitp refuses to take over a configuration another local proxy program
-/// manages, before it writes anything, and says how to proceed.
+/// The last setup run wins for Claude Code: aitp takes over the settings
+/// another local proxy program wrote, keeps a copy of them, says how to
+/// switch back, and leaves that program's CA alone.
 #[test]
-fn aitp_does_not_take_over_another_programs_configuration() {
+fn aitp_takes_over_claude_settings_of_another_program() {
+    let sandbox = Sandbox::new();
+    let ca = sandbox.home.join("other/other-ca.crt");
+    other_installation_ca(&ca);
+    let ca_before = snapshot(&ca);
+    let settings = sandbox.home.join(".claude").join("settings.json");
+    std::fs::create_dir_all(settings.parent().unwrap()).unwrap();
+    std::fs::write(
+        &settings,
+        serde_json::to_vec(&serde_json::json!({
+            "env": {
+                "https_proxy": "http://127.0.0.1:4000",
+                "NODE_EXTRA_CA_CERTS": ca,
+            },
+            "theme": "dark",
+        }))
+        .unwrap(),
+    )
+    .unwrap();
+    let before = snapshot(&settings);
+
+    // The note goes to standard output (Windows PowerShell 5.1 turns
+    // redirected standard error into a terminating error).
+    let (success, text, errors) = sandbox.output_split(&mut sandbox.command(&[
+        "init",
+        "--base-url",
+        "http://127.0.0.1:9",
+        "--api-key",
+        "TEST_ONLY_AITP",
+    ]));
+    assert!(success, "{text}{errors}");
+    assert!(
+        text.contains("Took over Claude Code from another local proxy program"),
+        "{text}"
+    );
+    assert!(!errors.contains("Took over"), "{errors}");
+    assert!(
+        text.contains("To switch back, run that program's setup again."),
+        "{text}"
+    );
+
+    let config = read_json(&sandbox.home.join(".aitp/config.json"));
+    let listen = config["listen"].as_str().unwrap();
+    let written = read_json(&settings);
+    assert_eq!(
+        written["env"]["https_proxy"],
+        serde_json::json!(format!("http://{listen}"))
+    );
+    assert_eq!(
+        written["env"]["NODE_EXTRA_CA_CERTS"],
+        config["ca_cert_path"]
+    );
+    assert_ne!(written["env"]["NODE_EXTRA_CA_CERTS"], serde_json::json!(ca));
+    assert_eq!(written["theme"], "dark");
+    assert_eq!(snapshot(&ca), ca_before);
+
+    let backups: Vec<_> = std::fs::read_dir(settings.parent().unwrap())
+        .unwrap()
+        .map(|entry| entry.unwrap().path())
+        .filter(|path| {
+            path.file_name()
+                .unwrap()
+                .to_string_lossy()
+                .starts_with("settings.json.bak-")
+        })
+        .collect();
+    assert_eq!(backups.len(), 1, "{backups:?}");
+    assert_eq!(snapshot(&backups[0]), before);
+    assert!(text.contains(&backups[0].display().to_string()), "{text}");
+
+    // A second run finds its own settings: nothing to take over.
+    let again = sandbox.run(&[
+        "init",
+        "--base-url",
+        "http://127.0.0.1:9",
+        "--api-key",
+        "TEST_ONLY_AITP",
+    ]);
+    assert!(!again.contains("Took over"), "{again}");
+}
+
+/// aitp refuses to take over a Codex or editor configuration another local
+/// proxy program manages, before it writes anything, and says how to
+/// proceed.
+#[test]
+fn aitp_does_not_take_over_another_programs_codex_or_editor_configuration() {
     let gateway = "http://127.0.0.1:9";
     let refused = |sandbox: &Sandbox, args: &[&str]| {
         let (success, text) = sandbox.output(&mut sandbox.command(args));
@@ -770,28 +882,6 @@ fn aitp_does_not_take_over_another_programs_configuration() {
         assert!(!sandbox.home.join(".aitp").join("config.json").exists());
         text
     };
-
-    // Claude: a local proxy with another program's installation CA.
-    let sandbox = Sandbox::new();
-    let ca = sandbox.home.join("other/other-ca.crt");
-    other_installation_ca(&ca);
-    let settings = sandbox.home.join(".claude").join("settings.json");
-    std::fs::create_dir_all(settings.parent().unwrap()).unwrap();
-    std::fs::write(
-        &settings,
-        serde_json::to_vec(&serde_json::json!({"env": {
-            "https_proxy": "http://127.0.0.1:4000",
-            "NODE_EXTRA_CA_CERTS": ca,
-        }}))
-        .unwrap(),
-    )
-    .unwrap();
-    let before = snapshot(&settings);
-    refused(
-        &sandbox,
-        &["init", "--base-url", gateway, "--api-key", "TEST_ONLY_AITP"],
-    );
-    assert_eq!(snapshot(&settings), before);
 
     // Codex: another program's managed block.
     let sandbox = Sandbox::new();
@@ -861,6 +951,64 @@ fn aitp_does_not_take_over_another_programs_configuration() {
         "{text}"
     );
     assert_eq!(snapshot(&editor), before);
+
+    // `init` that also asks for editor setup: a foreign editor refuses the
+    // whole command before the (otherwise taken over) Claude settings move.
+    let sandbox = Sandbox::new();
+    let ca = sandbox.home.join("other/other-ca.crt");
+    other_installation_ca(&ca);
+    let settings = sandbox.home.join(".claude").join("settings.json");
+    std::fs::create_dir_all(settings.parent().unwrap()).unwrap();
+    std::fs::write(
+        &settings,
+        serde_json::to_vec(&serde_json::json!({"env": {
+            "https_proxy": "http://127.0.0.1:4000",
+            "NODE_EXTRA_CA_CERTS": ca,
+        }}))
+        .unwrap(),
+    )
+    .unwrap();
+    let editor = sandbox.root.join("vscode/user-data/User/settings.json");
+    std::fs::create_dir_all(editor.parent().unwrap()).unwrap();
+    std::fs::write(
+        &editor,
+        "{\n // OTHER managed VSCode proxy: http://127.0.0.1:4000\n \"http.proxy\": \"http://127.0.0.1:4000\"\n}\n",
+    )
+    .unwrap();
+    let (settings_before, editor_before) = (snapshot(&settings), snapshot(&editor));
+    let mut flags = vec!["--configure-vscode-editor"];
+    if cfg!(windows) {
+        flags.push("--trust-vscode-ca");
+    }
+    for flag in flags {
+        let (success, text) = sandbox.output(
+            sandbox
+                .command(&[
+                    "init",
+                    "--base-url",
+                    gateway,
+                    "--api-key",
+                    "TEST_ONLY_AITP",
+                    flag,
+                ])
+                .env("VSCODE_PORTABLE", sandbox.root.join("vscode")),
+        );
+        assert!(!success, "{text}");
+        assert!(
+            text.contains("is managed by another local proxy program"),
+            "{text}"
+        );
+        assert!(!text.contains("Took over"), "{text}");
+        assert_eq!(snapshot(&settings), settings_before);
+        assert_eq!(snapshot(&editor), editor_before);
+        assert_eq!(
+            std::fs::read_dir(settings.parent().unwrap())
+                .unwrap()
+                .count(),
+            1
+        );
+        assert!(!sandbox.home.join(".aitp").join("config.json").exists());
+    }
 }
 
 /// aitp does not use another program's installation CA as its own, even
