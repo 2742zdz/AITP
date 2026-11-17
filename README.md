@@ -68,8 +68,8 @@ If another local proxy program built on the same kernel set up Claude Code
 before, the last setup you run wins: `aitp init` takes those settings over,
 keeps a copy next to them (`settings.json.bak-<time>`) and says so. That
 program and its CA are left installed; to switch back, run its setup again.
-Codex and editor settings of another program are still refused (use a
-separate `CODEX_HOME`).
+Codex and editor settings of another program are still refused: give Codex
+a separate `CODEX_HOME`, and leave out the editor-wide setup options.
 
 The installer never prints the API key. It hands it to `aitp init` as a
 command-line argument, the only way `aitp init` takes it, so it is visible
