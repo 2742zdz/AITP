@@ -807,6 +807,9 @@ fn init_claude(args: InitArgs) -> Result<()> {
     })?;
 
     let timestamp = Utc::now().format("%Y%m%d-%H%M%S%.9f").to_string();
+    // Another local proxy program's settings are taken over (the last setup
+    // run wins); read before anything is written, reported once done.
+    let previous_owner = coexistence::claude_profile_evidence(settings_path);
     backup_if_exists(settings_path, &timestamp)?;
     backup_if_exists(state_path, &timestamp)?;
     remove_if_exists_with_backup(credentials_path, &timestamp)?;
@@ -851,6 +854,14 @@ fn init_claude(args: InitArgs) -> Result<()> {
     println!("  {}", app_config_path()?.display());
     println!("Removed stale Claude OAuth credentials if present:");
     println!("  {}", credentials_path.display());
+    if let Some(reason) = previous_owner {
+        // Standard output: Windows PowerShell 5.1 turns redirected standard
+        // error into a terminating error.
+        println!(
+            "Took over Claude Code from another local proxy program ({reason}).\n  Its settings were saved to {}.bak-{timestamp}\n  To switch back, run that program's setup again.",
+            settings_path.display()
+        );
+    }
     warn_claude_settings_overrides_for_paths(&paths);
     configure_vscode_editor_after_initialization(
         &app_config.config.listen,
@@ -864,10 +875,12 @@ fn init_claude(args: InitArgs) -> Result<()> {
     Ok(())
 }
 
-/// Brands with `refuse_foreign_profiles` do not take over a configuration
-/// that another local proxy program built on this kernel manages, nor use
-/// its CA (see `coexistence`): checked before the command writes anything.
-/// Other brands keep their behavior; nothing is read for this.
+/// Brands with `refuse_foreign_profiles` do not take over a Codex or editor
+/// configuration that another local proxy program built on this kernel
+/// manages, nor use its CA (see `coexistence`): checked before the command
+/// writes anything. Claude Code settings are taken over instead (the last
+/// setup run wins; `init_claude` backs them up and says so). Other brands
+/// keep their behavior; nothing is read for this.
 fn refuse_foreign_targets(command: &Command) -> Result<()> {
     if !BRAND.refuse_foreign_profiles {
         return Ok(());
@@ -897,12 +910,6 @@ fn refuse_foreign_targets(command: &Command) -> Result<()> {
                 .config_dir
                 .join(CA_FILENAME.get()),
         )?;
-    }
-    if claude {
-        let paths = resolve_claude_config_paths()?;
-        if let Some(reason) = coexistence::claude_profile_evidence(&paths.settings_path) {
-            return Err(coexistence::refusal(&paths.settings_path, &reason));
-        }
     }
     if codex {
         refuse_foreign_codex_profile(&codex_config_dir()?)?;

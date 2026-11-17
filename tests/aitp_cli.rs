@@ -750,10 +750,92 @@ fn snapshot(path: &Path) -> Vec<u8> {
     std::fs::read(path).unwrap()
 }
 
-/// aitp refuses to take over a configuration another local proxy program
-/// manages, before it writes anything, and says how to proceed.
+/// The last setup run wins for Claude Code: aitp takes over the settings
+/// another local proxy program wrote, keeps a copy of them, says how to
+/// switch back, and leaves that program's CA alone.
 #[test]
-fn aitp_does_not_take_over_another_programs_configuration() {
+fn aitp_takes_over_claude_settings_of_another_program() {
+    let sandbox = Sandbox::new();
+    let ca = sandbox.home.join("other/other-ca.crt");
+    other_installation_ca(&ca);
+    let ca_before = snapshot(&ca);
+    let settings = sandbox.home.join(".claude").join("settings.json");
+    std::fs::create_dir_all(settings.parent().unwrap()).unwrap();
+    std::fs::write(
+        &settings,
+        serde_json::to_vec(&serde_json::json!({
+            "env": {
+                "https_proxy": "http://127.0.0.1:4000",
+                "NODE_EXTRA_CA_CERTS": ca,
+            },
+            "theme": "dark",
+        }))
+        .unwrap(),
+    )
+    .unwrap();
+    let before = snapshot(&settings);
+
+    let text = sandbox.run(&[
+        "init",
+        "--base-url",
+        "http://127.0.0.1:9",
+        "--api-key",
+        "TEST_ONLY_AITP",
+    ]);
+    assert!(
+        text.contains("Took over Claude Code from another local proxy program"),
+        "{text}"
+    );
+    assert!(
+        text.contains("To switch back, run that program's setup again."),
+        "{text}"
+    );
+
+    let config = read_json(&sandbox.home.join(".aitp/config.json"));
+    let listen = config["listen"].as_str().unwrap();
+    let written = read_json(&settings);
+    assert_eq!(
+        written["env"]["https_proxy"],
+        serde_json::json!(format!("http://{listen}"))
+    );
+    assert_eq!(
+        written["env"]["NODE_EXTRA_CA_CERTS"],
+        config["ca_cert_path"]
+    );
+    assert_ne!(written["env"]["NODE_EXTRA_CA_CERTS"], serde_json::json!(ca));
+    assert_eq!(written["theme"], "dark");
+    assert_eq!(snapshot(&ca), ca_before);
+
+    let backups: Vec<_> = std::fs::read_dir(settings.parent().unwrap())
+        .unwrap()
+        .map(|entry| entry.unwrap().path())
+        .filter(|path| {
+            path.file_name()
+                .unwrap()
+                .to_string_lossy()
+                .starts_with("settings.json.bak-")
+        })
+        .collect();
+    assert_eq!(backups.len(), 1, "{backups:?}");
+    assert_eq!(snapshot(&backups[0]), before);
+    assert!(text.contains(&backups[0].display().to_string()), "{text}");
+
+    // A second run finds its own settings: nothing to take over.
+    let again = sandbox.run(&[
+        "init",
+        "--base-url",
+        "http://127.0.0.1:9",
+        "--api-key",
+        "TEST_ONLY_AITP",
+    ]);
+    assert!(!again.contains("Took over"), "{again}");
+}
+
+/// aitp refuses to take over a Codex or editor configuration another local
+/// proxy program manages, before it writes anything, and says how to
+/// proceed.
+#[test]
+fn aitp_does_not_take_over_another_programs_codex_or_editor_configuration() {
     let gateway = "http://127.0.0.1:9";
     let refused = |sandbox: &Sandbox, args: &[&str]| {
         let (success, text) = sandbox.output(&mut sandbox.command(args));
@@ -770,28 +852,6 @@ fn aitp_does_not_take_over_another_programs_configuration() {
         assert!(!sandbox.home.join(".aitp").join("config.json").exists());
         text
     };
-
-    // Claude: a local proxy with another program's installation CA.
-    let sandbox = Sandbox::new();
-    let ca = sandbox.home.join("other/other-ca.crt");
-    other_installation_ca(&ca);
-    let settings = sandbox.home.join(".claude").join("settings.json");
-    std::fs::create_dir_all(settings.parent().unwrap()).unwrap();
-    std::fs::write(
-        &settings,
-        serde_json::to_vec(&serde_json::json!({"env": {
-            "https_proxy": "http://127.0.0.1:4000",
-            "NODE_EXTRA_CA_CERTS": ca,
-        }}))
-        .unwrap(),
-    )
-    .unwrap();
-    let before = snapshot(&settings);
-    refused(
-        &sandbox,
-        &["init", "--base-url", gateway, "--api-key", "TEST_ONLY_AITP"],
-    );
-    assert_eq!(snapshot(&settings), before);
 
     // Codex: another program's managed block.
     let sandbox = Sandbox::new();

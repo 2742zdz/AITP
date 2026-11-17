@@ -64,6 +64,13 @@ settings (`~/.claude/settings.json`) at the local proxy. `aitp claude` works
 too and starts the proxy first if it is not running. Codex goes through the
 proxy with `aitp codex`.
 
+If another local proxy program built on the same kernel set up Claude Code
+before, the last setup you run wins: `aitp init` takes those settings over,
+keeps a copy next to them (`settings.json.bak-<time>`) and says so. That
+program and its CA are left installed; to switch back, run its setup again.
+Codex and editor settings of another program are still refused (use a
+separate `CODEX_HOME`).
+
 The installer never prints the API key. It hands it to `aitp init` as a
 command-line argument, the only way `aitp init` takes it, so it is visible
 to other processes of the same machine while `aitp init` runs (and, in the
