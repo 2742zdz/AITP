@@ -430,7 +430,16 @@ impl OfficialDaemon<'_> {
             // A stopped daemon can leave its socket behind (seen on Windows);
             // the official command then fails instead of reporting it stopped.
             Err(_) if refuses_connections(&socket) => return Ok(None),
-            Err(error) => return Err(error),
+            Err(error) => {
+                let Some(target) = missing_symlink_target(&socket) else {
+                    return Err(error);
+                };
+                return match recorded_daemon(self.home) {
+                    // The next direct `codex` starts a fresh daemon by itself.
+                    Liveness::Exited => Ok(None),
+                    liveness => Err(missing_control_socket(&target, liveness)),
+                };
+            }
         };
         if version.get("status").and_then(Value::as_str) != Some("running") {
             bail!("the official daemon command did not report a running app-server");
@@ -500,6 +509,81 @@ fn refuses_connections(socket: &Path) -> bool {
         let _ = sender.send(refused);
     });
     receiver.recv_timeout(PROBE_TIMEOUT).unwrap_or(false)
+}
+
+/// On Unix the control socket is a symlink into a short temporary directory
+/// (`/tmp/codex-daemon-<uid>/` on Linux). A temporary-file cleanup can delete
+/// that target while the daemon keeps running: `version` then fails to
+/// connect, and direct `codex` stops with "app server did not become ready"
+/// instead of starting a new daemon (the PID-based `restart` still works).
+/// Returns the missing target.
+fn missing_symlink_target(socket: &Path) -> Option<PathBuf> {
+    let target = fs::read_link(socket).ok()?;
+    match fs::metadata(socket) {
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Some(
+            socket
+                .parent()
+                .map_or(target.clone(), |dir| dir.join(&target)),
+        ),
+        _ => None,
+    }
+}
+
+#[derive(Debug, PartialEq)]
+enum Liveness {
+    Running(u32),
+    Exited,
+    Unknown,
+}
+
+/// Liveness of the process the official pid backend recorded for this home.
+/// A reused PID reads as running (a needless warning, never a missed one);
+/// the PID-based restart verifies the process identity itself.
+fn recorded_daemon(home: &Path) -> Liveness {
+    let pid = fs::read(home.join("app-server-daemon/daemon.pid"))
+        .ok()
+        .and_then(|raw| serde_json::from_slice::<Value>(&raw).ok())
+        .and_then(|record| record.get("pid")?.as_u64())
+        .and_then(|pid| u32::try_from(pid).ok())
+        .filter(|pid| *pid > 0);
+    pid.map_or(Liveness::Unknown, process_liveness)
+}
+
+#[cfg(unix)]
+fn process_liveness(pid: u32) -> Liveness {
+    // Signal 0 only checks existence. 0 and negative values address process
+    // groups and are never passed.
+    let Ok(raw) = libc::pid_t::try_from(pid) else {
+        return Liveness::Unknown;
+    };
+    if raw <= 0 {
+        return Liveness::Unknown;
+    }
+    if unsafe { libc::kill(raw, 0) } == 0 {
+        return Liveness::Running(pid);
+    }
+    match std::io::Error::last_os_error().raw_os_error() {
+        Some(libc::EPERM) => Liveness::Running(pid),
+        Some(libc::ESRCH) => Liveness::Exited,
+        _ => Liveness::Unknown,
+    }
+}
+
+#[cfg(not(unix))]
+fn process_liveness(_pid: u32) -> Liveness {
+    Liveness::Unknown
+}
+
+fn missing_control_socket(target: &Path, liveness: Liveness) -> anyhow::Error {
+    let target = target.display();
+    match liveness {
+        Liveness::Running(pid) => anyhow!(
+            "its control socket target {target} is missing (often removed by a temporary-file cleanup) and recorded PID {pid} still exists, so the daemon is probably still running but unreachable; direct `codex` then fails with \"app server did not become ready\""
+        ),
+        _ => anyhow!(
+            "its control socket target {target} is missing (often removed by a temporary-file cleanup); if the daemon is still running, direct `codex` fails with \"app server did not become ready\""
+        ),
+    }
 }
 
 fn same_path(left: &Path, right: &Path) -> bool {
@@ -1117,6 +1201,94 @@ mod tests {
         drop(ControlListener::bind(&leftover).unwrap());
         assert!(refused_eventually(&leftover));
         let daemon = OfficialDaemon { home: home.path() };
+        assert!(daemon.version_report().unwrap().is_none());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn only_a_symlink_whose_target_is_gone_counts_as_a_deleted_socket() {
+        let dir = tempfile::tempdir().unwrap();
+        let existing = dir.path().join("existing.sock");
+        fs::write(&existing, "").unwrap();
+        let live = dir.path().join("live");
+        std::os::unix::fs::symlink(&existing, &live).unwrap();
+        assert_eq!(missing_symlink_target(&live), None);
+        assert_eq!(missing_symlink_target(&existing), None);
+        assert_eq!(missing_symlink_target(&dir.path().join("absent")), None);
+        let dangling = dir.path().join("dangling");
+        std::os::unix::fs::symlink("gone/daemon.sock", &dangling).unwrap();
+        assert_eq!(
+            missing_symlink_target(&dangling),
+            Some(dir.path().join("gone/daemon.sock"))
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn recorded_daemon_pid_is_read_defensively() {
+        let home = tempfile::tempdir().unwrap();
+        assert_eq!(recorded_daemon(home.path()), Liveness::Unknown);
+        let record = home.path().join("app-server-daemon");
+        fs::create_dir(&record).unwrap();
+        let write = |raw: String| fs::write(record.join("daemon.pid"), raw).unwrap();
+        // Above pid_t or u32: never truncated into another (or a group) PID.
+        for raw in [
+            "not json",
+            r#"{"other":1}"#,
+            r#"{"pid":"1"}"#,
+            r#"{"pid":0}"#,
+            r#"{"pid":-1}"#,
+            r#"{"pid":4294967295}"#,
+            r#"{"pid":4294967296}"#,
+        ] {
+            write(raw.into());
+            assert_eq!(recorded_daemon(home.path()), Liveness::Unknown, "{raw}");
+        }
+        assert_eq!(process_liveness(0), Liveness::Unknown);
+        let own = std::process::id();
+        write(json!({"pid": own, "processStartTime": "synthetic"}).to_string());
+        assert_eq!(recorded_daemon(home.path()), Liveness::Running(own));
+        // PID 1 exists on Linux/macOS; success and EPERM both mean running.
+        assert_eq!(process_liveness(1), Liveness::Running(1));
+        // Above the Linux (at most 2^22) and macOS (99998) PID limits.
+        write(json!({"pid": i32::MAX}).to_string());
+        assert_eq!(recorded_daemon(home.path()), Liveness::Exited);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn deleted_control_socket_is_diagnosed_unless_the_recorded_daemon_exited() {
+        let home = tempfile::tempdir().unwrap();
+        let control = home.path().join("app-server-control");
+        fs::create_dir(&control).unwrap();
+        let target = home.path().join("short/daemon.sock");
+        std::os::unix::fs::symlink(&target, control.join("app-server-control.sock")).unwrap();
+        let running = missing_control_socket(&target, Liveness::Running(42)).to_string();
+        let shown = target.display().to_string();
+        assert!(
+            running.contains(&shown)
+                && running.contains("recorded PID 42 still exists")
+                && running.contains("app server did not become ready"),
+            "{running}"
+        );
+        let unknown = missing_control_socket(&target, Liveness::Unknown).to_string();
+        assert!(
+            unknown.contains(&shown) && unknown.contains("if the daemon is still running"),
+            "{unknown}"
+        );
+        // Wiring: the official version command fails (or Codex is absent)
+        // either way, like the leftover-socket test above.
+        let daemon = OfficialDaemon { home: home.path() };
+        assert_eq!(daemon.version_report().unwrap_err().to_string(), unknown);
+        // A daemon that already exited is not running: direct `codex` starts
+        // a new one, so doctor must not warn.
+        let record = home.path().join("app-server-daemon");
+        fs::create_dir(&record).unwrap();
+        fs::write(
+            record.join("daemon.pid"),
+            json!({"pid": i32::MAX}).to_string(),
+        )
+        .unwrap();
         assert!(daemon.version_report().unwrap().is_none());
     }
 
