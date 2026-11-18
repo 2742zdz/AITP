@@ -4109,7 +4109,7 @@ fn local_proxy_chatgpt_spki(listen: &str) -> Result<String> {
             spki = Some(value.trim().to_string());
         }
     }
-    let spki = spki.with_context(|| format!("running {brand_product} proxy does not expose a Desktop certificate pin; run `{brand_binary} restart` and retry", brand_binary = crate::environment_scope::command_hint(), brand_product = BRAND.product_name))?;
+    let spki = spki.with_context(|| format!("running {brand_product} proxy does not expose a Desktop certificate pin; run `{brand_binary}{selector} restart` and retry", brand_binary = BRAND.binary_name, selector = crate::environment_scope::selector_suffix(), brand_product = BRAND.product_name))?;
     let pins = spki.split(',').collect::<Vec<_>>();
     if pins.is_empty() || pins.iter().any(|pin| pin.trim().is_empty()) {
         bail!(
@@ -4645,19 +4645,22 @@ fn listen_endpoint_owners(_addr: SocketAddr) -> Vec<ListenPortOwner> {
 }
 
 fn already_running_message(listen: &str, listener: &SelectedListener, verbose: bool) -> String {
-    let hint = environment_scope::command_hint();
     let mut message = match listener {
         SelectedListener::Service(_) => format!(
             "This environment's {brand_product} proxy is already running as a service at http://{listen}; nothing to start.\n\
-Status: {hint} status\n\
-To run it in this terminal instead, stop the service first: {hint} stop",
+Status: {brand_binary}{selector} status\n\
+To run it in this terminal instead, stop the service first: {brand_binary}{selector} stop",
+            brand_binary = BRAND.binary_name,
+            selector = environment_scope::selector_suffix(),
             brand_product = BRAND.product_name
         ),
         SelectedListener::CertificateMatch(owners) => format!(
             "A proxy with this environment's {brand_product} certificate is already running at http://{listen} ({}); nothing to start.\n\
-Status: {hint} status\n\
-To run it in this terminal instead, stop that process first (it may be `{hint}` running in another terminal).",
+Status: {brand_binary}{selector} status\n\
+To run it in this terminal instead, stop that process first (it may be `{brand_binary}{selector}` running in another terminal).",
             unmanaged_owner_summary(owners),
+            brand_binary = BRAND.binary_name,
+            selector = environment_scope::selector_suffix(),
             brand_product = BRAND.product_name
         ),
     };
@@ -4762,9 +4765,10 @@ fn run_upstream_proxy_command(value: Option<String>) -> Result<()> {
     cfg.upstream_proxy = (!value.eq_ignore_ascii_case("system")).then(|| value.to_string());
     write_app_config_at(&app_config_path()?, &cfg)?;
     println!(
-        "upstream proxy set to {}; run `{brand_binary} restart` to apply it to the running service",
+        "upstream proxy set to {}; run `{brand_binary}{selector} restart` to apply it to the running service",
         upstream_proxy::describe_setting(cfg.upstream_proxy.as_deref()),
-        brand_binary = crate::environment_scope::command_hint()
+        brand_binary = BRAND.binary_name,
+        selector = crate::environment_scope::selector_suffix()
     );
     Ok(())
 }
@@ -4918,8 +4922,16 @@ fn run_service_start() -> Result<()> {
         }
     }
     println!("Listening: http://{}", cfg.listen);
-    println!("Status: {} status", environment_scope::command_hint());
-    println!("Logs: {} logs", environment_scope::command_hint());
+    println!(
+        "Status: {brand_binary}{selector} status",
+        brand_binary = BRAND.binary_name,
+        selector = environment_scope::selector_suffix()
+    );
+    println!(
+        "Logs: {brand_binary}{selector} logs",
+        brand_binary = BRAND.binary_name,
+        selector = environment_scope::selector_suffix()
+    );
     Ok(())
 }
 
@@ -4951,9 +4963,10 @@ fn run_service_start() -> Result<()> {
     // listener instead of racing it and reallocating the port.
     if !wait_for_local_listener(&cfg.listen, MACOS_LISTENER_READY_TIMEOUT) {
         eprintln!(
-            "{brand_product} LaunchAgent was started but is not listening on {} yet; check `{brand_binary} logs`.",
+            "{brand_product} LaunchAgent was started but is not listening on {} yet; check `{brand_binary}{selector} logs`.",
             cfg.listen,
-            brand_binary = crate::environment_scope::command_hint(),
+            brand_binary = BRAND.binary_name,
+            selector = crate::environment_scope::selector_suffix(),
             brand_product = BRAND.product_name
         );
     }
@@ -4963,8 +4976,16 @@ fn run_service_start() -> Result<()> {
     );
     println!("Service: {}", plist_path.display());
     println!("Listening: http://{}", cfg.listen);
-    println!("Status: {} status", environment_scope::command_hint());
-    println!("Logs: {} logs", environment_scope::command_hint());
+    println!(
+        "Status: {brand_binary}{selector} status",
+        brand_binary = BRAND.binary_name,
+        selector = environment_scope::selector_suffix()
+    );
+    println!(
+        "Logs: {brand_binary}{selector} logs",
+        brand_binary = BRAND.binary_name,
+        selector = environment_scope::selector_suffix()
+    );
     Ok(())
 }
 
@@ -5007,8 +5028,16 @@ fn run_service_start() -> Result<()> {
     );
     println!("PID: {pid}");
     println!("Listening: http://{}", cfg.listen);
-    println!("Status: {} status", environment_scope::command_hint());
-    println!("Logs: {} logs", environment_scope::command_hint());
+    println!(
+        "Status: {brand_binary}{selector} status",
+        brand_binary = BRAND.binary_name,
+        selector = environment_scope::selector_suffix()
+    );
+    println!(
+        "Logs: {brand_binary}{selector} logs",
+        brand_binary = BRAND.binary_name,
+        selector = environment_scope::selector_suffix()
+    );
     Ok(())
 }
 
@@ -5717,8 +5746,9 @@ fn run_update() -> Result<()> {
                 // as a failed update when the local proxy remains reachable.
                 if update_refresh_failure_is_recoverable(configured_local_proxy_reachable()) {
                     eprintln!(
-                        "WARN {brand_product} client was updated and the local proxy remains reachable, but its automatic service refresh reported: {err:#}. Run `{brand_binary} restart` later to retry the refresh.",
-                        brand_binary = crate::environment_scope::command_hint(),
+                        "WARN {brand_product} client was updated and the local proxy remains reachable, but its automatic service refresh reported: {err:#}. Run `{brand_binary}{selector} restart` later to retry the refresh.",
+                        brand_binary = BRAND.binary_name,
+                        selector = crate::environment_scope::selector_suffix(),
                         brand_product = BRAND.product_name
                     );
                 } else {
@@ -5743,8 +5773,9 @@ fn run_update() -> Result<()> {
         );
     } else {
         println!(
-            "{brand_product} service was not active; run `{brand_binary} start` when needed.",
-            brand_binary = crate::environment_scope::command_hint(),
+            "{brand_product} service was not active; run `{brand_binary}{selector} start` when needed.",
+            brand_binary = BRAND.binary_name,
+            selector = crate::environment_scope::selector_suffix(),
             brand_product = BRAND.product_name
         );
     }
@@ -5858,8 +5889,9 @@ fn run_doctor(target: DoctorTarget) -> Result<()> {
             Err(err) if is_local_proxy_connect_error(&err) => report.warn(
                 "local proxy MITM",
                 format!(
-                    "{err:#}; start it with `{brand_binary} start`",
-                    brand_binary = crate::environment_scope::command_hint()
+                    "{err:#}; start it with `{brand_binary}{selector} start`",
+                    brand_binary = BRAND.binary_name,
+                    selector = crate::environment_scope::selector_suffix()
                 ),
             ),
             Err(err) => report.error("local proxy MITM", format!("{err:#}")),
@@ -6625,7 +6657,7 @@ fn check_app_config(report: &mut DoctorReport, cfg: &AppConfig) {
                 Ok(_) => report.ok("local proxy", format!("reachable at http://{addr}")),
                 Err(err) => report.warn(
                     "local proxy",
-                    format!("not reachable at http://{addr} ({err}); start it with `{brand_binary} start`", brand_binary = crate::environment_scope::command_hint()),
+                    format!("not reachable at http://{addr} ({err}); start it with `{brand_binary}{selector} start`", brand_binary = BRAND.binary_name, selector = crate::environment_scope::selector_suffix()),
                 ),
             }
         }
@@ -7211,19 +7243,22 @@ fn ensure_listen_available(listen: &str) -> Result<()> {
 
 fn listen_in_use_error(in_use: &ListenInUse, listener: Option<&SelectedListener>) -> anyhow::Error {
     let addr = in_use.addr;
-    let hint = environment_scope::command_hint();
     match listener {
         Some(SelectedListener::Service(owners)) => anyhow::anyhow!(
             "local proxy listen address {addr} is already in use by this environment's {brand_product} service ({}). \
-Run `{hint} restart` to refresh it, or `{hint} stop` first.",
+Run `{brand_binary}{selector} restart` to refresh it, or `{brand_binary}{selector} stop` first.",
             unmanaged_owner_summary(owners),
+            brand_binary = BRAND.binary_name,
+            selector = environment_scope::selector_suffix(),
             brand_product = BRAND.product_name
         ),
         Some(SelectedListener::CertificateMatch(owners)) => anyhow::anyhow!(
             "local proxy listen address {addr} is already in use by a proxy with this environment's {brand_product} certificate ({}); \
-whether `{hint} start` manages it could not be confirmed (it may be `{hint}` running in another terminal). \
-Check `{hint} status`; stop that process first if it is not the service, then rerun the command.",
+whether `{brand_binary}{selector} start` manages it could not be confirmed (it may be `{brand_binary}{selector}` running in another terminal). \
+Check `{brand_binary}{selector} status`; stop that process first if it is not the service, then rerun the command.",
             unmanaged_owner_summary(owners),
+            brand_binary = BRAND.binary_name,
+            selector = environment_scope::selector_suffix(),
             brand_product = BRAND.product_name
         ),
         None => {
@@ -7520,10 +7555,10 @@ async fn check_local_proxy_mitm(cfg: &AppConfig) -> Result<String> {
         b"GET /api/claude_code/policy_limits HTTP/1.1\r\nHost: api.anthropic.com\r\nConnection: close\r\n\r\n",
     )
     .await
-    .with_context(|| format!("local proxy closed before the reused sidecar probe; restart the proxy with `{brand_binary} restart`", brand_binary = crate::environment_scope::command_hint()))?;
+    .with_context(|| format!("local proxy closed before the reused sidecar probe; restart the proxy with `{brand_binary}{selector} restart`", brand_binary = BRAND.binary_name, selector = crate::environment_scope::selector_suffix()))?;
     let policy_head = read_http_response_head(&mut tls, "sidecar policy_limits response")
         .await
-        .with_context(|| format!("local proxy did not keep the sidecar TLS connection alive; restart the proxy with `{brand_binary} restart`", brand_binary = crate::environment_scope::command_hint()))?;
+        .with_context(|| format!("local proxy did not keep the sidecar TLS connection alive; restart the proxy with `{brand_binary}{selector} restart`", brand_binary = BRAND.binary_name, selector = crate::environment_scope::selector_suffix()))?;
     let policy_status = http_status_code(&policy_head)?;
     if policy_status != 200 {
         bail!("sidecar policy_limits probe returned HTTP {policy_status}, expected 200");
@@ -7637,7 +7672,7 @@ fn check_service_config(report: &mut DoctorReport) {
             if ensure_systemd_user_available().is_ok() && service_is_active().unwrap_or(false) {
                 report.warn(
                     "service manager",
-                    format!("systemd and managed background instances are both active; run `{brand_binary} restart`", brand_binary = crate::environment_scope::command_hint()),
+                    format!("systemd and managed background instances are both active; run `{brand_binary}{selector} restart`", brand_binary = BRAND.binary_name, selector = crate::environment_scope::selector_suffix()),
                 );
             }
             return;
@@ -7645,9 +7680,10 @@ fn check_service_config(report: &mut DoctorReport) {
         Ok(Some(state)) => report.warn(
             "service state",
             format!(
-                "stale managed background state for pid {}; run `{brand_binary} start`",
+                "stale managed background state for pid {}; run `{brand_binary}{selector} start`",
                 state.pid,
-                brand_binary = crate::environment_scope::command_hint()
+                brand_binary = BRAND.binary_name,
+                selector = crate::environment_scope::selector_suffix()
             ),
         ),
         Ok(None) => {}
@@ -7658,7 +7694,7 @@ fn check_service_config(report: &mut DoctorReport) {
         report.warn(
             "service",
             format!(
-                "not running; systemd --user unavailable ({err}); `{brand_binary} start` will use the managed background fallback", brand_binary = crate::environment_scope::command_hint()
+                "not running; systemd --user unavailable ({err}); `{brand_binary}{selector} start` will use the managed background fallback", brand_binary = BRAND.binary_name, selector = crate::environment_scope::selector_suffix()
             ),
         );
         return;
@@ -7678,8 +7714,9 @@ fn check_service_config(report: &mut DoctorReport) {
         report.warn(
             "service",
             format!(
-                "not installed; run `{brand_binary} start` to install it",
-                brand_binary = crate::environment_scope::command_hint()
+                "not installed; run `{brand_binary}{selector} start` to install it",
+                brand_binary = BRAND.binary_name,
+                selector = crate::environment_scope::selector_suffix()
             ),
         );
         return;

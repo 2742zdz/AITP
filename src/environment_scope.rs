@@ -275,11 +275,11 @@ fn raw_variable(name: &str) -> String {
 }
 
 fn both_selected_error(example: &str) -> anyhow::Error {
-    let binary = BRAND.binary_name;
     anyhow::anyhow!(
-        "both Claude and Codex environments are selected (CLAUDE_CONFIG_DIR={}, CODEX_HOME={}); choose one:\n  {binary} --environment claude{example}\n  {binary} --environment codex{example}\n  {binary} --environment default{example}",
+        "both Claude and Codex environments are selected (CLAUDE_CONFIG_DIR={}, CODEX_HOME={}); choose one:\n  {brand_binary} --environment claude{example}\n  {brand_binary} --environment codex{example}\n  {brand_binary} --environment default{example}",
         raw_variable("CLAUDE_CONFIG_DIR"),
         raw_variable("CODEX_HOME"),
+        brand_binary = BRAND.binary_name,
     )
 }
 
@@ -498,12 +498,12 @@ fn shell_quote_for(text: &str, powershell: bool) -> String {
     }
 }
 
-/// `<binary>` plus the selector naming the active scope, for copyable hints.
-pub(crate) fn command_hint() -> String {
-    match active().and_then(|scope| scope.selector.as_deref()) {
-        Some(selector) => format!("{} {selector}", BRAND.binary_name),
-        None => BRAND.binary_name.to_string(),
-    }
+/// ` <selector>` naming the active scope (empty when a bare command already
+/// does), for hints written `{brand_binary}{selector} <command>`.
+pub(crate) fn selector_suffix() -> String {
+    active()
+        .and_then(|scope| scope.selector.as_deref())
+        .map_or_else(String::new, |selector| format!(" {selector}"))
 }
 /// Arguments that run `command_args` in one product environment.
 pub(crate) fn each_environment_args(product: &str, command_args: &[&str]) -> Vec<String> {
