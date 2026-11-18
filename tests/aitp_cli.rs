@@ -2048,3 +2048,210 @@ fn test_helpers_read_keys_and_versions_exactly() {
     replace_bytes(&mut program, b"KEYKEY", b"NEWKEY", 1);
     assert_eq!(program, b"aaa NEWKEY bbb");
 }
+
+/// A sandbox whose shell selects a separate Claude and a separate Codex
+/// environment (`CLAUDE_CONFIG_DIR` and `CODEX_HOME` both set), both
+/// initialized and not started.
+struct BothEnvironments {
+    sandbox: Sandbox,
+    claude_dir: PathBuf,
+    codex_dir: PathBuf,
+}
+
+impl BothEnvironments {
+    fn new() -> Self {
+        let sandbox = Sandbox::new();
+        let claude_dir = sandbox.root.join("claude-config");
+        let codex_dir = sandbox.root.join("codex-home");
+        std::fs::create_dir_all(&claude_dir).unwrap();
+        std::fs::create_dir_all(&codex_dir).unwrap();
+        let both = Self {
+            sandbox,
+            claude_dir,
+            codex_dir,
+        };
+        let gateway = "http://127.0.0.1:9";
+        for (command, key) in [
+            ("init", "TEST_ONLY_AITP_CLAUDE_KEY"),
+            ("init-codex", "TEST_ONLY_AITP_CODEX_KEY"),
+        ] {
+            let (success, text) = both.output(&[command, "--base-url", gateway, "--api-key", key]);
+            assert!(success, "aitp {command} failed:\n{text}");
+        }
+        both
+    }
+
+    fn command(&self, args: &[&str]) -> Command {
+        let mut command = self.sandbox.command(args);
+        command
+            .env("CLAUDE_CONFIG_DIR", &self.claude_dir)
+            .env("CODEX_HOME", &self.codex_dir);
+        command
+    }
+
+    fn output(&self, args: &[&str]) -> (bool, String) {
+        self.sandbox.output(&mut self.command(args))
+    }
+
+    /// The isolated environment directory created for `product`.
+    fn environment(&self, product: &str) -> PathBuf {
+        let environments = self.sandbox.home.join(".aitp/environments");
+        let mut found = std::fs::read_dir(&environments)
+            .unwrap()
+            .map(|entry| entry.unwrap().path())
+            .filter(|path| {
+                path.file_name()
+                    .and_then(|name| name.to_str())
+                    .is_some_and(|name| name.starts_with(&format!("{product}-")))
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(found.len(), 1, "{found:?}");
+        found.remove(0)
+    }
+}
+
+/// Status and stop are run once in each selected environment instead of
+/// failing as ambiguous; commands that cannot run twice still ask for a
+/// choice and name the variables and copyable selectors.
+#[test]
+fn both_selected_environments_run_service_commands_in_each() {
+    let both = BothEnvironments::new();
+    let claude = both.environment("claude");
+    let codex = both.environment("codex");
+
+    let (success, status) = both.output(&["status"]);
+    assert!(success, "{status}");
+    let claude_header = status
+        .find("== Claude environment: aitp --environment claude status ==")
+        .expect(&status);
+    let codex_header = status
+        .find("== Codex environment: aitp --environment codex status ==")
+        .expect(&status);
+    assert!(claude_header < codex_header, "{status}");
+    let configs = status
+        .lines()
+        .filter_map(|line| line.strip_prefix("config: "))
+        .map(|path| canonical(Path::new(path)))
+        .collect::<Vec<_>>();
+    assert_eq!(
+        configs,
+        [claude.join("config.json"), codex.join("config.json")],
+        "{status}"
+    );
+
+    let (success, stop) = both.output(&["stop"]);
+    assert!(success, "{stop}");
+    assert!(
+        stop.contains("== Codex environment: aitp --environment codex stop =="),
+        "{stop}"
+    );
+
+    let (success, logs) = both.output(&["logs"]);
+    assert!(!success, "{logs}");
+    for expected in [
+        "both Claude and Codex environments are selected",
+        "CLAUDE_CONFIG_DIR=",
+        "CODEX_HOME=",
+        "aitp --environment claude logs\n",
+        "aitp --environment codex logs\n",
+    ] {
+        assert!(logs.contains(expected), "{expected}: {logs}");
+    }
+    assert!(!logs.contains("== Claude environment"), "{logs}");
+    both.sandbox.assert_only_aitp_names();
+}
+
+/// Kills the long-running foreground proxy when the test ends.
+struct RunningProxy(std::process::Child);
+
+impl Drop for RunningProxy {
+    fn drop(&mut self) {
+        let _ = self.0.kill();
+        let _ = self.0.wait();
+    }
+}
+
+/// Typing the foreground command while this environment's proxy already
+/// serves its address reports that and succeeds; a pinned instance (as a
+/// service manager starts it) still fails so the manager notices.
+#[test]
+fn foreground_proxy_reports_this_environments_running_proxy() {
+    let both = BothEnvironments::new();
+    let codex = both.environment("codex");
+    let listen = read_json(&codex.join("config.json"))["listen"]
+        .as_str()
+        .unwrap()
+        .to_string();
+    let log = both.sandbox.root.join("foreground.log");
+    let file = std::fs::File::create(&log).unwrap();
+    let mut first = both.command(&["--environment", "codex"]);
+    first.stdout(file.try_clone().unwrap()).stderr(file);
+    let mut running = RunningProxy(first.spawn().unwrap());
+    let address = listen.parse::<std::net::SocketAddr>().unwrap();
+    let deadline = Instant::now() + Duration::from_secs(30);
+    while std::net::TcpStream::connect_timeout(&address, Duration::from_millis(200)).is_err() {
+        if let Some(status) = running.0.try_wait().unwrap() {
+            panic!(
+                "foreground proxy exited with {status}:\n{}",
+                std::fs::read_to_string(&log).unwrap_or_default()
+            );
+        }
+        assert!(
+            Instant::now() < deadline,
+            "proxy did not listen on {listen}:\n{}",
+            std::fs::read_to_string(&log).unwrap_or_default()
+        );
+        std::thread::sleep(Duration::from_millis(100));
+    }
+
+    for args in [
+        &["--environment", "codex"][..],
+        &["--environment", "codex", "-v"],
+    ] {
+        let (success, text) = both.output(args);
+        assert!(success, "{args:?}: {text}");
+        assert!(
+            text.contains(&format!("already running at http://{listen}")),
+            "{text}"
+        );
+        // Not started by `start`: show status, never suggest the service stop.
+        assert!(
+            text.contains("Status: aitp --environment codex status"),
+            "{text}"
+        );
+        assert!(!text.contains("aitp --environment codex stop"), "{text}");
+        assert_eq!(
+            text.contains("This invocation did not change request logging."),
+            args.contains(&"-v"),
+            "{text}"
+        );
+    }
+
+    let codex_text = codex.to_str().unwrap();
+    let (success, text) = both.output(&["--instance-dir", codex_text]);
+    assert!(!success, "{text}");
+    assert!(
+        text.contains(&format!("{listen} is already in use")),
+        "{text}"
+    );
+    // Never a bare command: with both environments selected it acts on both.
+    assert!(!text.contains("`aitp stop`"), "{text}");
+    assert!(!text.contains("`aitp status`"), "{text}");
+    assert!(text.contains("`aitp --instance-dir '"), "{text}");
+    both.sandbox.assert_only_aitp_names();
+}
+
+/// A non-loopback address is refused before anything connects to it, even
+/// when typed by a user (where a running proxy would be accepted).
+#[test]
+fn foreground_proxy_refuses_non_loopback_before_probing() {
+    let both = BothEnvironments::new();
+    let config_path = both.environment("codex").join("config.json");
+    let mut config = read_json(&config_path);
+    config["listen"] = serde_json::Value::from("192.0.2.1:9");
+    std::fs::write(&config_path, serde_json::to_vec_pretty(&config).unwrap()).unwrap();
+    let (success, text) = both.output(&["--environment", "codex"]);
+    assert!(!success, "{text}");
+    assert!(text.contains("loopback-only"), "{text}");
+    both.sandbox.assert_only_aitp_names();
+}

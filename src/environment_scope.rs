@@ -21,7 +21,28 @@ pub(crate) struct Scope {
     pub directory: PathBuf,
     pub isolated: bool,
     product_dir: Option<PathBuf>,
+    /// Selector that names exactly this scope from the user's shell, repeated
+    /// in hints so a copied command never acts on another environment.
+    selector: Option<String>,
+    /// Started by a service manager, launcher or as a background worker
+    /// (`--instance-dir` or the worker command). Such a process runs with
+    /// its instance as program home, so service names derived here may not
+    /// be the user's.
+    managed: bool,
 }
+
+/// How a command maps onto environments.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum Resolution {
+    /// `ACTIVE` holds the one selected environment.
+    Single,
+    /// Both product environments are selected and the command is safe to run
+    /// once in each; `ACTIVE` stays unset.
+    Each,
+}
+
+/// Products that `Resolution::Each` runs, in order.
+pub(crate) const EACH_PRODUCT: [&str; 2] = ["claude", "codex"];
 
 impl Scope {
     fn new(root: PathBuf, directory: PathBuf) -> Self {
@@ -31,6 +52,8 @@ impl Scope {
             directory,
             isolated,
             product_dir: None,
+            selector: None,
+            managed: false,
         }
     }
 
@@ -214,13 +237,62 @@ fn command_product(command: &Command) -> Option<&'static str> {
     }
 }
 
-pub(crate) fn initialize(command: &Command, selector: Option<(String, String)>) -> Result<()> {
+/// Service and diagnostic commands that, with both product environments
+/// selected, run once in each. Foreground and log commands still need a choice.
+fn runs_in_each_environment(command: &Command) -> bool {
+    matches!(
+        command,
+        Command::Doctor(DoctorTarget::All)
+            | Command::Status
+            | Command::Start
+            | Command::Stop
+            | Command::Restart
+    )
+}
+
+/// Copyable arguments for the ambiguity hint. A proxy URL may carry
+/// credentials, so it is never repeated.
+fn command_example(command: &Command) -> &'static str {
+    match command {
+        Command::RunProxy { verbose: false } => "",
+        Command::RunProxy { verbose: true } => " -v",
+        Command::Logs => " logs",
+        Command::Update => " update",
+        Command::UpstreamProxy(None) => " upstream-proxy",
+        // The parser's keywords (any case, surrounding space ignored).
+        Command::UpstreamProxy(Some(value)) => match value.trim().to_ascii_lowercase().as_str() {
+            "" | "system" => " upstream-proxy system",
+            "direct" | "none" => " upstream-proxy direct",
+            _ => " upstream-proxy <proxy-url>",
+        },
+        _ => " <command>",
+    }
+}
+
+/// The variable as the user set it (selection uses the normalized path).
+fn raw_variable(name: &str) -> String {
+    env::var_os(name).map_or_else(String::new, |value| value.to_string_lossy().into_owned())
+}
+
+fn both_selected_error(example: &str) -> anyhow::Error {
+    let binary = BRAND.binary_name;
+    anyhow::anyhow!(
+        "both Claude and Codex environments are selected (CLAUDE_CONFIG_DIR={}, CODEX_HOME={}); choose one:\n  {binary} --environment claude{example}\n  {binary} --environment codex{example}\n  {binary} --environment default{example}",
+        raw_variable("CLAUDE_CONFIG_DIR"),
+        raw_variable("CODEX_HOME"),
+    )
+}
+
+pub(crate) fn initialize(
+    command: &Command,
+    selector: Option<(String, String)>,
+) -> Result<Resolution> {
     // Uninstall enumerates every environment itself and never uses a scope.
     if matches!(
         command,
         Command::Help | Command::Version | Command::Uninstall(_)
     ) {
-        return Ok(());
+        return Ok(Resolution::Single);
     }
     let (home, root) = layout()?;
     let product = command_product(command);
@@ -247,10 +319,12 @@ pub(crate) fn initialize(command: &Command, selector: Option<(String, String)>) 
                 let claude = product_directory(&root, &home, "claude")?;
                 let codex = product_directory(&root, &home, "codex")?;
                 match (claude.0 != root, codex.0 != root) {
-                    (true, true) => bail!(
-                        "both Claude and Codex environments are selected; use {brand_binary} --environment claude|codex|default <command>",
-                        brand_binary = BRAND.binary_name
-                    ),
+                    (true, true) if runs_in_each_environment(command) => {
+                        return Ok(Resolution::Each);
+                    }
+                    (true, true) => {
+                        return Err(both_selected_error(command_example(command)));
+                    }
                     (true, false) => claude,
                     (false, true) => codex,
                     _ => (root.clone(), None),
@@ -272,6 +346,16 @@ pub(crate) fn initialize(command: &Command, selector: Option<(String, String)>) 
         );
         scope = Scope::new(scope.root.clone(), scope.root);
     }
+    // Would a bare management command pick another environment here?
+    let overridden = |product| {
+        product_directory(&scope.root, &home, product).map_or(true, |(dir, _)| dir != scope.root)
+    };
+    let any_override = overridden("claude") || overridden("codex");
+    scope.managed = selector
+        .as_ref()
+        .is_some_and(|(flag, _)| flag == "--instance-dir")
+        || is_background_worker(command);
+    scope.selector = selector_hint(&scope, selector.as_ref(), any_override);
     if scope.isolated {
         eprintln!(
             "{brand_product} environment: {}",
@@ -282,7 +366,7 @@ pub(crate) fn initialize(command: &Command, selector: Option<(String, String)>) 
     ACTIVE
         .set(scope)
         .map_err(|_| anyhow::anyhow!("environment was already resolved"))?;
-    Ok(())
+    Ok(Resolution::Single)
 }
 
 fn legacy_route_matches(root: &Path, product: &str) -> Result<bool> {
@@ -348,6 +432,87 @@ pub(crate) fn active() -> Option<&'static Scope> {
 pub(crate) fn isolated() -> bool {
     active().is_some_and(|scope| scope.isolated)
 }
+/// See `Scope::managed`.
+pub(crate) fn launched_by_manager() -> bool {
+    active().is_some_and(|scope| scope.managed)
+}
+/// The selector that names `scope` from the user's shell: the instance
+/// directory when it was pinned, the product of an isolated environment, or
+/// `default` when a bare command would pick a product environment instead.
+fn selector_hint(
+    scope: &Scope,
+    typed: Option<&(String, String)>,
+    any_override: bool,
+) -> Option<String> {
+    if scope.managed {
+        return Some(format!("--instance-dir {}", shell_quote(&scope.directory)));
+    }
+    if scope.isolated {
+        let product = scope
+            .directory
+            .parent()
+            .filter(|parent| *parent == scope.root.join("environments"))
+            .and_then(|_| scope.directory.file_name()?.to_str())
+            .and_then(environment_product);
+        return Some(match product {
+            Some(product) => format!("--environment {product}"),
+            None => format!("--instance-dir {}", shell_quote(&scope.directory)),
+        });
+    }
+    (any_override || typed.is_some()).then(|| "--environment default".to_string())
+}
+
+/// Background workers run with their instance as program home and without
+/// the product variables; only the instance directory names them.
+fn is_background_worker(command: &Command) -> bool {
+    match command {
+        #[cfg(target_os = "linux")]
+        Command::RunLinuxBackgroundProxy => true,
+        #[cfg(target_os = "windows")]
+        Command::RunWindowsBackgroundProxy => true,
+        _ => false,
+    }
+}
+
+/// One argument for the user's shell (POSIX shells; PowerShell on Windows),
+/// so `$`, quotes and spaces in a path cannot change the target.
+fn shell_quote(path: &Path) -> String {
+    shell_quote_for(&path.to_string_lossy(), cfg!(windows))
+}
+
+fn shell_quote_for(text: &str, powershell: bool) -> String {
+    if powershell {
+        // PowerShell ends a single-quoted string at any of these; doubling
+        // one keeps it literally.
+        let mut quoted = String::from("'");
+        for c in text.chars() {
+            if matches!(c, '\'' | '\u{2018}' | '\u{2019}' | '\u{201A}' | '\u{201B}') {
+                quoted.push(c);
+            }
+            quoted.push(c);
+        }
+        quoted.push('\'');
+        quoted
+    } else {
+        format!("'{}'", text.replace('\'', "'\\''"))
+    }
+}
+
+/// `<binary>` plus the selector naming the active scope, for copyable hints.
+pub(crate) fn command_hint() -> String {
+    match active().and_then(|scope| scope.selector.as_deref()) {
+        Some(selector) => format!("{} {selector}", BRAND.binary_name),
+        None => BRAND.binary_name.to_string(),
+    }
+}
+/// Arguments that run `command_args` in one product environment.
+pub(crate) fn each_environment_args(product: &str, command_args: &[&str]) -> Vec<String> {
+    ["--environment", product]
+        .iter()
+        .chain(command_args)
+        .map(|arg| arg.to_string())
+        .collect()
+}
 #[cfg(target_os = "linux")]
 pub(crate) fn service_name() -> String {
     format!(
@@ -393,6 +558,69 @@ mod tests {
         assert!(normalize(&temp.path().join("a/file/child")).is_ok());
         fs::write(temp.path().join("a/file"), "x").unwrap();
         assert!(normalize(&temp.path().join("a/file/child")).is_err());
+    }
+    #[test]
+    fn selector_hints_name_the_resolved_scope() {
+        let root = PathBuf::from("/k");
+        let codex = Scope::new(
+            root.clone(),
+            root.join("environments/codex-0123456789abcdef01234567"),
+        );
+        // Implicitly selected by CODEX_HOME: still named explicitly.
+        assert_eq!(
+            selector_hint(&codex, None, true).as_deref(),
+            Some("--environment codex")
+        );
+        let default = Scope::new(root.clone(), root.clone());
+        assert_eq!(selector_hint(&default, None, false), None);
+        assert_eq!(
+            selector_hint(&default, None, true).as_deref(),
+            Some("--environment default")
+        );
+        // A legacy launcher route fell back from a product selector.
+        let typed = ("--environment".to_string(), "claude".to_string());
+        assert_eq!(
+            selector_hint(&default, Some(&typed), false).as_deref(),
+            Some("--environment default")
+        );
+        // A service manager or worker: only the instance directory names it,
+        // even when it is the program home (root == directory).
+        let pinned = ("--instance-dir".to_string(), "rel".to_string());
+        let mut odd = Scope::new(
+            PathBuf::from("/x/it's $HOME"),
+            PathBuf::from("/x/it's $HOME"),
+        );
+        odd.managed = true;
+        let quoted = selector_hint(&odd, Some(&pinned), true).unwrap();
+        assert_eq!(selector_hint(&odd, None, false), Some(quoted.clone()));
+        assert_eq!(
+            quoted,
+            format!("--instance-dir {}", shell_quote(&odd.directory))
+        );
+        assert_eq!(
+            shell_quote_for("/x/it's $HOME", false),
+            "'/x/it'\\''s $HOME'"
+        );
+        assert_eq!(
+            shell_quote_for("C:\\Users\\O\u{2019}Brien's $x", true),
+            "'C:\\Users\\O\u{2019}\u{2019}Brien''s $x'"
+        );
+        assert_eq!(command_example(&Command::Logs), " logs");
+        assert_eq!(
+            command_example(&Command::UpstreamProxy(Some("http://u:p@h:1".into()))),
+            " upstream-proxy <proxy-url>"
+        );
+        for value in ["direct", " NONE "] {
+            assert_eq!(
+                command_example(&Command::UpstreamProxy(Some(value.into()))),
+                " upstream-proxy direct"
+            );
+        }
+        assert_eq!(
+            command_example(&Command::UpstreamProxy(None)),
+            " upstream-proxy"
+        );
+        assert_eq!(command_example(&Command::Status), " <command>");
     }
     #[test]
     fn default_and_projects_have_distinct_service_identities() {

@@ -68,7 +68,7 @@ async fn bind_listener(root: &Path, main_listen: &str) -> Result<tokio::net::Tcp
 fn read_endpoint(root: &Path, main_listen: &str) -> Result<std::net::SocketAddr> {
     let endpoint: ProxyEndpoint = serde_json::from_slice(
         &fs::read(root.join("desktop/claude/state/proxy.json"))
-            .with_context(|| format!("Claude Desktop listener is unavailable; run `{brand_binary} restart` in this environment, then retry `{brand_binary} desktop claude`", brand_binary = BRAND.binary_name))?,
+            .with_context(|| format!("Claude Desktop listener is unavailable; run `{brand_binary} restart` in this environment, then retry `{binary} desktop claude`", brand_binary = crate::environment_scope::command_hint(), binary = BRAND.binary_name))?,
     )?;
     if endpoint.main_listen != main_listen
         || !endpoint.listen.ip().is_loopback()
@@ -76,8 +76,9 @@ fn read_endpoint(root: &Path, main_listen: &str) -> Result<std::net::SocketAddr>
         || endpoint.listen.to_string() == main_listen
     {
         bail!(
-            "invalid or stale Claude Desktop listener receipt; run `{brand_binary} restart` in this environment, then retry `{brand_binary} desktop claude`",
-            brand_binary = BRAND.binary_name
+            "invalid or stale Claude Desktop listener receipt; run `{brand_binary} restart` in this environment, then retry `{binary} desktop claude`",
+            brand_binary = crate::environment_scope::command_hint(),
+            binary = BRAND.binary_name
         );
     }
     Ok(endpoint.listen)
@@ -92,12 +93,13 @@ fn verified_endpoint(root: &Path, cfg: &crate::AppConfig) -> Result<(String, Str
         .enable_all()
         .build()?;
     runtime.block_on(crate::connect_local_proxy_tls(&desktop_cfg))
-        .with_context(|| format!("Claude Desktop listener does not authenticate with this environment's CA; run `{brand_binary} restart` in this environment, then retry `{brand_binary} desktop claude`", brand_binary = BRAND.binary_name))?;
+        .with_context(|| format!("Claude Desktop listener does not authenticate with this environment's CA; run `{brand_binary} restart` in this environment, then retry `{binary} desktop claude`", brand_binary = crate::environment_scope::command_hint(), binary = BRAND.binary_name))?;
     let pins = crate::local_proxy_chatgpt_spki(&listen)?;
     if pins.split(',').count() != 2 {
         bail!(
-            "listener is not the dedicated Claude Desktop entry; run `{brand_binary} restart` in this environment, then retry `{brand_binary} desktop claude`",
-            brand_binary = BRAND.binary_name
+            "listener is not the dedicated Claude Desktop entry; run `{brand_binary} restart` in this environment, then retry `{binary} desktop claude`",
+            brand_binary = crate::environment_scope::command_hint(),
+            binary = BRAND.binary_name
         );
     }
     Ok((listen, pins))

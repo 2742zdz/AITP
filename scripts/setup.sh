@@ -379,7 +379,13 @@ main() {
   fi
   if [ "${install_only}" = 0 ]; then
     if [ "${no_start}" = 1 ]; then
-      say "next: start the local proxy with: ${aitp_command} start"
+      # Only what was configured: a bare `start` also refreshes a separately
+      # selected Codex environment's running proxy.
+      if [ "${codex}" = 1 ]; then
+        say "next: start the local proxy with: ${aitp_command} start"
+      else
+        say "next: start the local proxy with: ${aitp_command} --environment claude start"
+      fi
     fi
     say "next: run Claude Code as usual (claude); it now goes through the AITP local proxy."
     say "      (${aitp_command} claude also works, and starts the proxy if it is not running.)"

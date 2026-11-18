@@ -162,3 +162,8 @@ test('the page sends and stores nothing about the key', () => {
     assert.deepEqual([...new Set(keys)].sort(), ['getItem', 'removeItem', 'setItem']);
     assert.ok(!/store\([^)]*api/i.test(source));
 });
+
+test('the later start command starts only what the setup configured', () => {
+    assert.equal(site.startCommand(false), 'aitp --environment claude start');
+    assert.equal(site.startCommand(true), 'aitp start');
+});
