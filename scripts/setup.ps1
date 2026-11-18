@@ -544,7 +544,10 @@ function Install-Aitp {
     if (-not $defaultDirectory -and -not $onPath) {
         Write-Setup "$directory is not on your PATH; add it to run aitp by name"
     }
-    if ($NoStart) { Write-Setup "next: start the local proxy with: aitp start" }
+    # Only what was configured: a bare `start` also refreshes a separately
+    # selected Codex environment's running proxy.
+    if ($NoStart -and $Codex) { Write-Setup "next: start the local proxy with: aitp start" }
+    elseif ($NoStart) { Write-Setup "next: start the local proxy with: aitp --environment claude start" }
     Write-Setup "next: run Claude Code as usual (claude); it now goes through the AITP local proxy."
     Write-Setup "      (aitp claude also works, and starts the proxy if it is not running.)"
     if ($Codex) { Write-Setup "      For Codex run: aitp codex" }

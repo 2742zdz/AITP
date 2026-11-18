@@ -338,7 +338,12 @@ pub fn run(distribution: &'static Brand, context: RuntimeContext) -> Result<()> 
             brand_product = BRAND.product_name
         );
     }
-    environment_scope::initialize(&command, selector)?;
+    // Service managers and launchers pin the instance; they must see a
+    // failure when the listener is taken so they restart or report it.
+    let pinned = matches!(&selector, Some((flag, _)) if flag == "--instance-dir");
+    if environment_scope::initialize(&command, selector)? == environment_scope::Resolution::Each {
+        return run_in_each_environment(&command);
+    }
     // Before anything is written (the product directory record included).
     refuse_foreign_targets(&command)?;
     match &command {
@@ -358,7 +363,7 @@ pub fn run(distribution: &'static Brand, context: RuntimeContext) -> Result<()> 
             println!("{USAGE}");
             Ok(())
         }
-        Command::RunProxy { verbose } => run_local_proxy(verbose),
+        Command::RunProxy { verbose } => run_local_proxy(verbose, !pinned),
         Command::Start => run_service_start(),
         Command::Stop => run_service_stop(),
         Command::Status => run_service_status(),
@@ -381,6 +386,58 @@ pub fn run(distribution: &'static Brand, context: RuntimeContext) -> Result<()> 
         #[cfg(target_os = "windows")]
         Command::RunWindowsBackgroundProxy => run_windows_background_proxy_worker(),
     }
+}
+
+/// Arguments of `command` for one product environment, or `None` when the
+/// command does not run per environment.
+fn each_environment_command(command: &Command, product: &'static str) -> Option<Vec<String>> {
+    let args: &[&str] = match command {
+        // Each environment checks only its own product.
+        Command::Doctor(DoctorTarget::All) => &["doctor", product],
+        Command::Status => &["status"],
+        Command::Start => &["start"],
+        Command::Stop => &["stop"],
+        Command::Restart => &["restart"],
+        _ => return None,
+    };
+    Some(environment_scope::each_environment_args(product, args))
+}
+
+/// Both product environments are selected: run the command once in each,
+/// in its own process (a process resolves exactly one environment).
+fn run_in_each_environment(command: &Command) -> Result<()> {
+    let exe = env::current_exe().with_context(|| {
+        format!(
+            "failed to resolve {brand_product} executable",
+            brand_product = BRAND.product_name
+        )
+    })?;
+    let mut failed = Vec::new();
+    for product in environment_scope::EACH_PRODUCT {
+        let args = each_environment_command(command, product)
+            .context("command does not run in each environment")?;
+        let label = if product == "claude" {
+            "Claude"
+        } else {
+            "Codex"
+        };
+        println!(
+            "== {label} environment: {} {} ==",
+            BRAND.binary_name,
+            args.join(" ")
+        );
+        std::io::stdout().flush().ok();
+        match ProcessCommand::new(&exe).args(&args).status() {
+            Ok(status) if status.success() => {}
+            Ok(status) => failed.push(format!("{label} ({status})")),
+            Err(error) => failed.push(format!("{label} ({error})")),
+        }
+        println!();
+    }
+    if !failed.is_empty() {
+        bail!("failed in the {} environment", failed.join(" and "));
+    }
+    Ok(())
 }
 
 #[derive(Debug)]
@@ -4052,7 +4109,7 @@ fn local_proxy_chatgpt_spki(listen: &str) -> Result<String> {
             spki = Some(value.trim().to_string());
         }
     }
-    let spki = spki.with_context(|| format!("running {brand_product} proxy does not expose a Desktop certificate pin; run `{brand_binary} restart` and retry", brand_binary = BRAND.binary_name, brand_product = BRAND.product_name))?;
+    let spki = spki.with_context(|| format!("running {brand_product} proxy does not expose a Desktop certificate pin; run `{brand_binary} restart` and retry", brand_binary = crate::environment_scope::command_hint(), brand_product = BRAND.product_name))?;
     let pins = spki.split(',').collect::<Vec<_>>();
     if pins.is_empty() || pins.iter().any(|pin| pin.trim().is_empty()) {
         bail!(
@@ -4509,10 +4566,132 @@ fn print_version() -> Result<()> {
     Ok(())
 }
 
-fn run_local_proxy(verbose: bool) -> Result<()> {
+/// This environment's proxy found listening on its configured address.
+#[derive(Debug, Clone, PartialEq, Eq)]
+/// Both carry the owners of exactly this address (never other addresses on
+/// the same port); empty where the platform cannot name socket owners.
+enum SelectedListener {
+    /// The process `<binary> start` manages owns exactly this address
+    /// (Linux, where socket owners are known).
+    Service(Vec<ListenPortOwner>),
+    /// The address answers with this environment's CA, but which process
+    /// manages it is not confirmed (for example `<binary>` in another
+    /// terminal, or a platform that cannot name socket owners).
+    CertificateMatch(Vec<ListenPortOwner>),
+}
+
+/// Bound for the whole identity probe: a listener that accepts but never
+/// answers must not hold a service lock or the next environment.
+const SELECTED_LISTENER_PROBE_LIMIT: Duration = Duration::from_secs(5);
+
+/// The exact configured address answers with this environment's CA (port
+/// owners alone cannot tell addresses or copies apart); then classify it.
+fn selected_listener(listen: &str, in_use: &ListenInUse) -> Option<SelectedListener> {
+    let config = read_app_config().ok()?;
+    if config.listen != listen {
+        return None;
+    }
+    let runtime = tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+        .ok()?;
+    // The timer must be created inside the runtime.
+    runtime
+        .block_on(async {
+            timeout(
+                SELECTED_LISTENER_PROBE_LIMIT,
+                connect_local_proxy_tls(&config),
+            )
+            .await
+        })
+        .ok()?
+        .ok()?;
+    let owners = listen_endpoint_owners(in_use.addr);
+    // A managed process runs with its instance as program home, where the
+    // derived service name may not be the user's: do not claim the service.
+    if !environment_scope::launched_by_manager() && selected_service_owns_endpoint(&owners) {
+        return Some(SelectedListener::Service(owners));
+    }
+    Some(SelectedListener::CertificateMatch(owners))
+}
+
+#[cfg(target_os = "linux")]
+fn selected_service_owns_endpoint(endpoint_owners: &[ListenPortOwner]) -> bool {
+    let pid = linux_background_state()
+        .ok()
+        .flatten()
+        .filter(linux_background_state_is_running)
+        .map(|state| state.pid)
+        .or_else(|| {
+            ensure_systemd_user_available().ok()?;
+            systemctl_value("MainPID")
+                .ok()?
+                .parse::<u32>()
+                .ok()
+                .filter(|pid| *pid != 0)
+        });
+    pid.is_some_and(|pid| endpoint_owners.iter().any(|owner| owner.pid == pid))
+}
+
+/// Without socket owners a loaded service proves nothing about this address.
+#[cfg(not(target_os = "linux"))]
+fn selected_service_owns_endpoint(_endpoint_owners: &[ListenPortOwner]) -> bool {
+    false
+}
+
+#[cfg(not(target_os = "linux"))]
+fn listen_endpoint_owners(_addr: SocketAddr) -> Vec<ListenPortOwner> {
+    Vec::new()
+}
+
+fn already_running_message(listen: &str, listener: &SelectedListener, verbose: bool) -> String {
+    let hint = environment_scope::command_hint();
+    let mut message = match listener {
+        SelectedListener::Service(_) => format!(
+            "This environment's {brand_product} proxy is already running as a service at http://{listen}; nothing to start.\n\
+Status: {hint} status\n\
+To run it in this terminal instead, stop the service first: {hint} stop",
+            brand_product = BRAND.product_name
+        ),
+        SelectedListener::CertificateMatch(owners) => format!(
+            "A proxy with this environment's {brand_product} certificate is already running at http://{listen} ({}); nothing to start.\n\
+Status: {hint} status\n\
+To run it in this terminal instead, stop that process first (it may be `{hint}` running in another terminal).",
+            unmanaged_owner_summary(owners),
+            brand_product = BRAND.product_name
+        ),
+    };
+    if verbose {
+        message.push_str("\nThis invocation did not change request logging.");
+    }
+    message
+}
+
+fn unmanaged_owner_summary(owners: &[ListenPortOwner]) -> String {
+    if owners.is_empty() {
+        "process not identified".to_string()
+    } else {
+        format_listen_owners(owners)
+    }
+}
+
+/// `already_running_ok`: typed by a user (no `--instance-dir`, not a
+/// background worker), so this environment's proxy already serving the
+/// configured address is the requested state rather than a failure.
+fn run_local_proxy(verbose: bool, already_running_ok: bool) -> Result<()> {
     let cfg = read_app_config()?;
     let (ca_cert_pem, ca_key_pem) = read_runtime_ca(&cfg)?;
-    ensure_listen_available(&cfg.listen)?;
+    if let Some((in_use, listener)) = listen_conflict(&cfg.listen)? {
+        // One identity probe decides both the message and the exit status.
+        if already_running_ok && let Some(listener) = &listener {
+            println!(
+                "{}",
+                already_running_message(&cfg.listen, listener, verbose)
+            );
+            return Ok(());
+        }
+        return Err(listen_in_use_error(&in_use, listener.as_ref()));
+    }
     if let Err(error) = migrate_legacy_claude_no_proxy_for_instance(&cfg.listen) {
         eprintln!("warning: could not update Claude no_proxy: {error:#}");
     }
@@ -4585,7 +4764,7 @@ fn run_upstream_proxy_command(value: Option<String>) -> Result<()> {
     println!(
         "upstream proxy set to {}; run `{brand_binary} restart` to apply it to the running service",
         upstream_proxy::describe_setting(cfg.upstream_proxy.as_deref()),
-        brand_binary = BRAND.binary_name
+        brand_binary = crate::environment_scope::command_hint()
     );
     Ok(())
 }
@@ -4739,14 +4918,8 @@ fn run_service_start() -> Result<()> {
         }
     }
     println!("Listening: http://{}", cfg.listen);
-    println!(
-        "Status: {brand_binary} status",
-        brand_binary = BRAND.binary_name
-    );
-    println!(
-        "Logs: {brand_binary} logs",
-        brand_binary = BRAND.binary_name
-    );
+    println!("Status: {} status", environment_scope::command_hint());
+    println!("Logs: {} logs", environment_scope::command_hint());
     Ok(())
 }
 
@@ -4780,7 +4953,7 @@ fn run_service_start() -> Result<()> {
         eprintln!(
             "{brand_product} LaunchAgent was started but is not listening on {} yet; check `{brand_binary} logs`.",
             cfg.listen,
-            brand_binary = BRAND.binary_name,
+            brand_binary = crate::environment_scope::command_hint(),
             brand_product = BRAND.product_name
         );
     }
@@ -4790,14 +4963,8 @@ fn run_service_start() -> Result<()> {
     );
     println!("Service: {}", plist_path.display());
     println!("Listening: http://{}", cfg.listen);
-    println!(
-        "Status: {brand_binary} status",
-        brand_binary = BRAND.binary_name
-    );
-    println!(
-        "Logs: {brand_binary} logs",
-        brand_binary = BRAND.binary_name
-    );
+    println!("Status: {} status", environment_scope::command_hint());
+    println!("Logs: {} logs", environment_scope::command_hint());
     Ok(())
 }
 
@@ -4840,14 +5007,8 @@ fn run_service_start() -> Result<()> {
     );
     println!("PID: {pid}");
     println!("Listening: http://{}", cfg.listen);
-    println!(
-        "Status: {brand_binary} status",
-        brand_binary = BRAND.binary_name
-    );
-    println!(
-        "Logs: {brand_binary} logs",
-        brand_binary = BRAND.binary_name
-    );
+    println!("Status: {} status", environment_scope::command_hint());
+    println!("Logs: {} logs", environment_scope::command_hint());
     Ok(())
 }
 
@@ -5557,7 +5718,7 @@ fn run_update() -> Result<()> {
                 if update_refresh_failure_is_recoverable(configured_local_proxy_reachable()) {
                     eprintln!(
                         "WARN {brand_product} client was updated and the local proxy remains reachable, but its automatic service refresh reported: {err:#}. Run `{brand_binary} restart` later to retry the refresh.",
-                        brand_binary = BRAND.binary_name,
+                        brand_binary = crate::environment_scope::command_hint(),
                         brand_product = BRAND.product_name
                     );
                 } else {
@@ -5583,7 +5744,7 @@ fn run_update() -> Result<()> {
     } else {
         println!(
             "{brand_product} service was not active; run `{brand_binary} start` when needed.",
-            brand_binary = BRAND.binary_name,
+            brand_binary = crate::environment_scope::command_hint(),
             brand_product = BRAND.product_name
         );
     }
@@ -5698,7 +5859,7 @@ fn run_doctor(target: DoctorTarget) -> Result<()> {
                 "local proxy MITM",
                 format!(
                     "{err:#}; start it with `{brand_binary} start`",
-                    brand_binary = BRAND.binary_name
+                    brand_binary = crate::environment_scope::command_hint()
                 ),
             ),
             Err(err) => report.error("local proxy MITM", format!("{err:#}")),
@@ -6464,7 +6625,7 @@ fn check_app_config(report: &mut DoctorReport, cfg: &AppConfig) {
                 Ok(_) => report.ok("local proxy", format!("reachable at http://{addr}")),
                 Err(err) => report.warn(
                     "local proxy",
-                    format!("not reachable at http://{addr} ({err}); start it with `{brand_binary} start`", brand_binary = BRAND.binary_name),
+                    format!("not reachable at http://{addr} ({err}); start it with `{brand_binary} start`", brand_binary = crate::environment_scope::command_hint()),
                 ),
             }
         }
@@ -6988,7 +7149,19 @@ fn check_proxy_setting_case_conflicts(report: &mut DoctorReport, env: &Map<Strin
     }
 }
 
-fn ensure_listen_available(listen: &str) -> Result<()> {
+/// The configured address is taken.
+#[derive(Debug)]
+struct ListenInUse {
+    addr: SocketAddr,
+    /// Linux reported EADDRINUSE but no process visibly owns a listener on
+    /// the port: usually a closed connection, possibly a process whose
+    /// sockets this user cannot inspect.
+    owner_unseen: bool,
+}
+
+/// `None` when the proxy can bind `listen`; invalid, non-loopback and other
+/// bind failures are errors before anything connects to the address.
+fn check_listen_available(listen: &str) -> Result<Option<ListenInUse>> {
     let addr = listen
         .parse::<SocketAddr>()
         .with_context(|| format!("invalid local proxy listen address {listen:?}"))?;
@@ -6999,32 +7172,73 @@ fn ensure_listen_available(listen: &str) -> Result<()> {
     match StdTcpListener::bind(addr) {
         Ok(listener) => {
             drop(listener);
-            Ok(())
+            Ok(None)
         }
         Err(err) if err.kind() == ErrorKind::AddrInUse => {
-            let owners = listen_port_owners(addr);
-            // Linux can report EADDRINUSE for a recently closed connection
-            // even though no process owns the listening socket. The Tokio
-            // listener uses the normal Unix reuse semantics, so let the real
-            // bind make the final decision in that case.
             #[cfg(target_os = "linux")]
-            if owners.is_empty() {
-                return Ok(());
-            }
+            let owner_unseen = listen_port_owners(addr).is_empty();
+            #[cfg(not(target_os = "linux"))]
+            let owner_unseen = false;
+            Ok(Some(ListenInUse { addr, owner_unseen }))
+        }
+        Err(err) => bail!("local proxy listen address {addr} is not available: {err}"),
+    }
+}
+
+/// The address is taken, with this environment's listener when one answers;
+/// the identity probe runs at most once.
+fn listen_conflict(listen: &str) -> Result<Option<(ListenInUse, Option<SelectedListener>)>> {
+    let Some(in_use) = check_listen_available(listen)? else {
+        return Ok(None);
+    };
+    let listener = selected_listener(listen, &in_use);
+    // Linux can report EADDRINUSE for a recently closed connection even
+    // though no process owns the listening socket. The Tokio listener uses
+    // the normal Unix reuse semantics, so unless the address answers as this
+    // environment's proxy, let the real bind make the final decision.
+    if in_use.owner_unseen && listener.is_none() {
+        return Ok(None);
+    }
+    Ok(Some((in_use, listener)))
+}
+
+fn ensure_listen_available(listen: &str) -> Result<()> {
+    match listen_conflict(listen)? {
+        None => Ok(()),
+        Some((in_use, listener)) => Err(listen_in_use_error(&in_use, listener.as_ref())),
+    }
+}
+
+fn listen_in_use_error(in_use: &ListenInUse, listener: Option<&SelectedListener>) -> anyhow::Error {
+    let addr = in_use.addr;
+    let hint = environment_scope::command_hint();
+    match listener {
+        Some(SelectedListener::Service(owners)) => anyhow::anyhow!(
+            "local proxy listen address {addr} is already in use by this environment's {brand_product} service ({}). \
+Run `{hint} restart` to refresh it, or `{hint} stop` first.",
+            unmanaged_owner_summary(owners),
+            brand_product = BRAND.product_name
+        ),
+        Some(SelectedListener::CertificateMatch(owners)) => anyhow::anyhow!(
+            "local proxy listen address {addr} is already in use by a proxy with this environment's {brand_product} certificate ({}); \
+whether `{hint} start` manages it could not be confirmed (it may be `{hint}` running in another terminal). \
+Check `{hint} status`; stop that process first if it is not the service, then rerun the command.",
+            unmanaged_owner_summary(owners),
+            brand_product = BRAND.product_name
+        ),
+        None => {
+            // Only owners of exactly this address: another address on the
+            // same port is not what the user has to stop.
+            let owners = listen_endpoint_owners(addr);
             let owner_summary = if owners.is_empty() {
-                format!("an unknown process on port {}", addr.port())
+                "a process that could not be identified".to_string()
             } else {
                 format_listen_owners(&owners)
             };
-            bail!(
-                "local proxy listen address {addr} is already in use by {}. \
-Stop the existing process, or if it is a {brand_product} service run `{brand_binary} stop` first.",
-                owner_summary,
-                brand_binary = BRAND.binary_name,
-                brand_product = BRAND.product_name
+            anyhow::anyhow!(
+                "local proxy listen address {addr} is already in use by {owner_summary}. Stop the existing process first."
             )
         }
-        Err(err) => bail!("local proxy listen address {addr} is not available: {err}"),
     }
 }
 
@@ -7070,7 +7284,48 @@ fn format_listen_owners(owners: &[ListenPortOwner]) -> String {
 
 #[cfg(target_os = "linux")]
 fn listen_port_owners(addr: SocketAddr) -> Vec<ListenPortOwner> {
-    let inodes = listen_socket_inodes(addr.port());
+    socket_inode_owners(&listen_socket_inodes(addr.port()))
+}
+
+/// Owners of a listener that serves exactly `addr`: bound to its address or
+/// to the unspecified address of its family, on its port.
+#[cfg(target_os = "linux")]
+fn listen_endpoint_owners(addr: SocketAddr) -> Vec<ListenPortOwner> {
+    let mut inodes = HashSet::new();
+    for path in ["/proc/net/tcp", "/proc/net/tcp6"] {
+        let Ok(content) = fs::read_to_string(path) else {
+            continue;
+        };
+        for line in content.lines().skip(1) {
+            if let Some(inode) = parse_proc_net_tcp_endpoint_inode(line, addr) {
+                inodes.insert(inode.to_string());
+            }
+        }
+    }
+    socket_inode_owners(&inodes)
+}
+
+#[cfg(target_os = "linux")]
+fn parse_proc_net_tcp_endpoint_inode(line: &str, addr: SocketAddr) -> Option<&str> {
+    let inode = parse_proc_net_tcp_listen_inode(line, addr.port())?;
+    let local = line.split_whitespace().nth(1)?;
+    let (ip_hex, _) = local.rsplit_once(':')?;
+    // Each 32-bit word is printed as a native-endian integer.
+    let mut bytes = Vec::with_capacity(16);
+    for chunk in ip_hex.as_bytes().chunks(8) {
+        let word = u32::from_str_radix(std::str::from_utf8(chunk).ok()?, 16).ok()?;
+        bytes.extend_from_slice(&word.to_ne_bytes());
+    }
+    let ip = match bytes.len() {
+        4 => std::net::IpAddr::from(<[u8; 4]>::try_from(bytes.as_slice()).ok()?),
+        16 => std::net::IpAddr::from(<[u8; 16]>::try_from(bytes.as_slice()).ok()?),
+        _ => return None,
+    };
+    (ip == addr.ip() || (ip.is_unspecified() && ip.is_ipv4() == addr.is_ipv4())).then_some(inode)
+}
+
+#[cfg(target_os = "linux")]
+fn socket_inode_owners(inodes: &HashSet<String>) -> Vec<ListenPortOwner> {
     if inodes.is_empty() {
         return Vec::new();
     }
@@ -7265,10 +7520,10 @@ async fn check_local_proxy_mitm(cfg: &AppConfig) -> Result<String> {
         b"GET /api/claude_code/policy_limits HTTP/1.1\r\nHost: api.anthropic.com\r\nConnection: close\r\n\r\n",
     )
     .await
-    .with_context(|| format!("local proxy closed before the reused sidecar probe; restart the proxy with `{brand_binary} restart`", brand_binary = BRAND.binary_name))?;
+    .with_context(|| format!("local proxy closed before the reused sidecar probe; restart the proxy with `{brand_binary} restart`", brand_binary = crate::environment_scope::command_hint()))?;
     let policy_head = read_http_response_head(&mut tls, "sidecar policy_limits response")
         .await
-        .with_context(|| format!("local proxy did not keep the sidecar TLS connection alive; restart the proxy with `{brand_binary} restart`", brand_binary = BRAND.binary_name))?;
+        .with_context(|| format!("local proxy did not keep the sidecar TLS connection alive; restart the proxy with `{brand_binary} restart`", brand_binary = crate::environment_scope::command_hint()))?;
     let policy_status = http_status_code(&policy_head)?;
     if policy_status != 200 {
         bail!("sidecar policy_limits probe returned HTTP {policy_status}, expected 200");
@@ -7382,7 +7637,7 @@ fn check_service_config(report: &mut DoctorReport) {
             if ensure_systemd_user_available().is_ok() && service_is_active().unwrap_or(false) {
                 report.warn(
                     "service manager",
-                    format!("systemd and managed background instances are both active; run `{brand_binary} restart`", brand_binary = BRAND.binary_name),
+                    format!("systemd and managed background instances are both active; run `{brand_binary} restart`", brand_binary = crate::environment_scope::command_hint()),
                 );
             }
             return;
@@ -7392,7 +7647,7 @@ fn check_service_config(report: &mut DoctorReport) {
             format!(
                 "stale managed background state for pid {}; run `{brand_binary} start`",
                 state.pid,
-                brand_binary = BRAND.binary_name
+                brand_binary = crate::environment_scope::command_hint()
             ),
         ),
         Ok(None) => {}
@@ -7403,7 +7658,7 @@ fn check_service_config(report: &mut DoctorReport) {
         report.warn(
             "service",
             format!(
-                "not running; systemd --user unavailable ({err}); `{brand_binary} start` will use the managed background fallback", brand_binary = BRAND.binary_name
+                "not running; systemd --user unavailable ({err}); `{brand_binary} start` will use the managed background fallback", brand_binary = crate::environment_scope::command_hint()
             ),
         );
         return;
@@ -7424,7 +7679,7 @@ fn check_service_config(report: &mut DoctorReport) {
             "service",
             format!(
                 "not installed; run `{brand_binary} start` to install it",
-                brand_binary = BRAND.binary_name
+                brand_binary = crate::environment_scope::command_hint()
             ),
         );
         return;
@@ -8786,7 +9041,7 @@ fn run_linux_background_proxy_worker() -> Result<()> {
             )
         });
     }
-    run_local_proxy(false)
+    run_local_proxy(false, false)
 }
 
 #[cfg(target_os = "linux")]
@@ -9255,7 +9510,7 @@ fn linux_configured_listen_has_app_owner() -> Result<bool> {
 
 #[cfg(target_os = "windows")]
 fn run_windows_background_proxy_worker() -> Result<()> {
-    run_local_proxy(false)
+    run_local_proxy(false, false)
 }
 
 #[cfg(target_os = "windows")]
@@ -11155,6 +11410,104 @@ HTTPS_PROXY="http://127.0.0.1:1111"
     }
 
     #[test]
+    fn each_environment_commands_select_one_product_and_keep_others_single() {
+        let args = |command: &Command, product| each_environment_command(command, product);
+        assert_eq!(
+            args(&Command::Doctor(DoctorTarget::All), "claude").unwrap(),
+            ["--environment", "claude", "doctor", "claude"]
+        );
+        for (command, name) in [
+            (Command::Status, "status"),
+            (Command::Start, "start"),
+            (Command::Stop, "stop"),
+            (Command::Restart, "restart"),
+        ] {
+            assert_eq!(
+                args(&command, "codex").unwrap(),
+                ["--environment", "codex", name]
+            );
+        }
+        for command in [
+            Command::RunProxy { verbose: false },
+            Command::Logs,
+            Command::Update,
+            Command::Doctor(DoctorTarget::Codex),
+            Command::UpstreamProxy(Some("http://user:secret@proxy:1".to_string())),
+        ] {
+            assert!(args(&command, "codex").is_none(), "{command:?}");
+        }
+    }
+
+    #[test]
+    fn already_running_messages_scope_hints_and_note_verbose() {
+        let bin = BRAND.binary_name;
+        let service =
+            already_running_message("127.0.0.1:1", &SelectedListener::Service(Vec::new()), false);
+        assert!(service.contains("already running as a service at http://127.0.0.1:1"));
+        assert!(service.contains(&format!("{bin} stop")));
+        assert!(!service.contains("request logging"));
+        let owners = [ListenPortOwner {
+            pid: 42,
+            name: bin.to_string(),
+        }];
+        let matched = already_running_message(
+            "127.0.0.1:1",
+            &SelectedListener::CertificateMatch(owners.to_vec()),
+            true,
+        );
+        assert!(matched.contains("pid 42"), "{matched}");
+        assert!(matched.contains(&format!("{bin} status")), "{matched}");
+        // Management is unconfirmed: never suggest the service `stop`.
+        assert!(!matched.contains(&format!("{bin} stop")), "{matched}");
+        assert!(matched.ends_with("This invocation did not change request logging."));
+        let unknown = already_running_message(
+            "127.0.0.1:1",
+            &SelectedListener::CertificateMatch(Vec::new()),
+            false,
+        );
+        assert!(unknown.contains("process not identified"), "{unknown}");
+    }
+
+    #[test]
+    fn listen_conflicts_suggest_stop_only_for_the_confirmed_service() {
+        let bin = BRAND.binary_name;
+        // Nothing can listen on port 0: the owner of exactly this address is
+        // not identified, and no stop is suggested for an unconfirmed process.
+        let in_use = ListenInUse {
+            addr: "127.0.0.1:0".parse().unwrap(),
+            owner_unseen: false,
+        };
+        let foreign = listen_in_use_error(&in_use, None).to_string();
+        assert!(foreign.contains("could not be identified"), "{foreign}");
+        assert!(!foreign.contains(&format!("{bin} stop")), "{foreign}");
+        // Only the exact endpoint's owners are named, not the whole port's.
+        let endpoint = vec![ListenPortOwner {
+            pid: 8,
+            name: bin.to_string(),
+        }];
+        let matched = listen_in_use_error(
+            &in_use,
+            Some(&SelectedListener::CertificateMatch(endpoint.clone())),
+        )
+        .to_string();
+        assert!(!matched.contains(&format!("{bin} stop")), "{matched}");
+        assert!(matched.contains(&format!("{bin} status")), "{matched}");
+        assert!(matched.contains("pid 8"), "{matched}");
+        let service =
+            listen_in_use_error(&in_use, Some(&SelectedListener::Service(endpoint))).to_string();
+        assert!(service.contains(&format!("{bin} stop")), "{service}");
+        assert!(service.contains("pid 8"), "{service}");
+    }
+
+    #[test]
+    fn non_loopback_listen_fails_before_any_probe() {
+        let error = check_listen_available("192.0.2.1:9")
+            .unwrap_err()
+            .to_string();
+        assert!(error.contains("loopback-only"), "{error}");
+    }
+
+    #[test]
     fn parses_doctor_and_version_commands() {
         match parse_command(&["doctor".to_string()]).unwrap() {
             Command::Doctor(DoctorTarget::All) => {}
@@ -12352,6 +12705,45 @@ HTTPS_PROXY="http://127.0.0.1:1111"
 
         let established = line.replacen(" 0A ", " 01 ", 1);
         assert_eq!(parse_proc_net_tcp_listen_inode(&established, 18081), None);
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn proc_net_tcp_endpoints_match_the_exact_address() {
+        let word = |ip: [u8; 4]| format!("{:08X}", u32::from_ne_bytes(ip));
+        let line = |ip: &str| {
+            format!(
+                "   0: {ip}:46A1 00000000:0000 0A 00000000:00000000 00:00000000 00000000  1000        0 123456 1 0000000000000000 100 0 0 10 0"
+            )
+        };
+        let loopback: SocketAddr = "127.0.0.1:18081".parse().unwrap();
+        let second: SocketAddr = "127.0.0.2:18081".parse().unwrap();
+        let own = line(&word([127, 0, 0, 1]));
+        assert_eq!(
+            parse_proc_net_tcp_endpoint_inode(&own, loopback),
+            Some("123456")
+        );
+        assert_eq!(parse_proc_net_tcp_endpoint_inode(&own, second), None);
+        let wildcard = line(&word([0, 0, 0, 0]));
+        assert_eq!(
+            parse_proc_net_tcp_endpoint_inode(&wildcard, second),
+            Some("123456")
+        );
+        let v6_loopback = line(&[[0; 4], [0; 4], [0; 4], [0, 0, 0, 1]].map(word).concat());
+        let v6: SocketAddr = "[::1]:18081".parse().unwrap();
+        assert_eq!(
+            parse_proc_net_tcp_endpoint_inode(&v6_loopback, v6),
+            Some("123456")
+        );
+        assert_eq!(
+            parse_proc_net_tcp_endpoint_inode(&v6_loopback, loopback),
+            None
+        );
+        let v6_wildcard = line(&"0".repeat(32));
+        assert_eq!(
+            parse_proc_net_tcp_endpoint_inode(&v6_wildcard, loopback),
+            None
+        );
     }
 
     #[cfg(target_os = "linux")]

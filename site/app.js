@@ -133,6 +133,13 @@
     return base.error ? null : base.url;
   }
 
+  // The later start command for a `--no-start` setup: only what it configured.
+  // With separately selected Claude and Codex environments a bare
+  // `aitp start` also refreshes Codex's running proxy.
+  function startCommand(codex) {
+    return codex ? 'aitp start' : 'aitp --environment claude start';
+  }
+
   var api = {
     shellQuote: shellQuote,
     psQuote: psQuote,
@@ -140,6 +147,7 @@
     parseBaseUrl: parseBaseUrl,
     parseApiKey: parseApiKey,
     buildCommand: buildCommand,
+    startCommand: startCommand,
     fragmentBaseUrl: fragmentBaseUrl,
     SITE_BASE: SITE_BASE,
     GITHUB_BASE: GITHUB_BASE
@@ -363,6 +371,9 @@
     $('shell-where').textContent = t(state.shell + 'Where');
     $('after-start').hidden = !$('opt-no-start').checked;
     $('after-codex').hidden = !$('opt-codex').checked;
+    var start = startCommand($('opt-codex').checked);
+    $('start-command').textContent = start;
+    $('copy-start').setAttribute('data-copy', start);
 
     if (result.error) {
       current = null;

@@ -305,10 +305,19 @@ class SetupTests:
         self.assertEqual(self.calls(), [self.init_call("1", "")])
 
     def test_no_start_and_codex(self):
-        self.assert_ok(self.run_setup(no_start=True, codex=True))
+        result = self.run_setup(no_start=True, codex=True)
+        self.assert_ok(result)
         codex = [f"AITP_BINARY_UPDATED=0", "AITP_SKIP_START=1", "arg=init-codex", "arg=--base-url",
                  f"arg={BASE_URL}", "arg=--api-key", f"arg={KEY}"]
         self.assertEqual(self.calls(), [self.init_call("1", "1"), codex])
+        self.assertRegex(result.stdout + result.stderr, r"next: start the local proxy with: .*aitp(\.exe)? start\n")
+
+    def test_no_start_names_the_claude_environment(self):
+        # A bare `start` would also refresh a separately selected Codex proxy.
+        result = self.run_setup(no_start=True)
+        self.assert_ok(result)
+        self.assertRegex(result.stdout + result.stderr,
+                         r"next: start the local proxy with: .*aitp(\.exe)? --environment claude start\n")
 
     def test_install_only(self):
         result = self.run_setup(base=None, key=None, install_only=True,
