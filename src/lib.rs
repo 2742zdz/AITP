@@ -938,27 +938,37 @@ fn init_claude(args: InitArgs) -> Result<()> {
 /// On macOS the background proxy is a LaunchAgent in the logged-in user's GUI
 /// domain. root has no such domain (`launchctl bootstrap gui/0` fails with
 /// "Domain does not support specified action"), and a root setup writes
-/// `/var/root/.claude` instead of the user's profile. Refuse the commands
-/// that write a profile or load the agent before they change anything.
+/// `/var/root` (or, under sudo keeping HOME, the user's profile as root).
+/// Only commands that neither write a profile nor start the proxy run as
+/// root: reading state, stopping, updating the program and uninstalling (so a
+/// root setup can be cleaned up). Launchers are refused too: `vscode`,
+/// `codex` and `desktop codex` start the service in-process when it is down.
 #[cfg_attr(not(target_os = "macos"), allow(dead_code))]
 fn refuse_macos_root(command: &Command, euid: u32) -> Result<()> {
     if euid != 0 {
         return Ok(());
     }
-    let name = match command {
-        Command::Init(_) => "init",
-        Command::InitCodex(_) => "init-codex",
-        Command::Start => "start",
-        Command::Restart => "restart",
-        _ => return Ok(()),
-    };
+    if matches!(
+        command,
+        Command::Help
+            | Command::Version
+            | Command::Status
+            | Command::Stop
+            | Command::Logs
+            | Command::Doctor(_)
+            | Command::ClaudeDesktopDoctor
+            | Command::Update
+            | Command::Uninstall(_)
+            | Command::UpstreamProxy(None)
+    ) {
+        return Ok(());
+    }
     bail!(
-        "`{brand_binary} {name}` must not run as root (or with sudo) on macOS: \
-         {brand_product} sets up the current user's profile and runs its local proxy \
-         as that user's LaunchAgent, and root has no login session for it. \
+        "{brand_product} must not run this command as root (or with sudo) on macOS: \
+         it sets up the current user's profile and runs its local proxy as that \
+         user's LaunchAgent, and root has no login session for it. \
          Leave the root shell (`exit`) or drop `sudo`, then run the command again \
-         as your normal macOS user.",
-        brand_binary = BRAND.binary_name,
+         as the user signed in to the Mac desktop.",
         brand_product = BRAND.product_name
     )
 }
@@ -11462,43 +11472,53 @@ HTTPS_PROXY="http://127.0.0.1:1111"
     }
 
     #[test]
-    fn macos_root_is_refused_only_for_setup_and_service_start() {
+    fn macos_root_is_refused_except_for_read_stop_update_and_uninstall() {
+        let parse = |args: &[&str]| {
+            parse_command(&args.iter().map(|arg| arg.to_string()).collect::<Vec<_>>()).unwrap()
+        };
         for args in [
-            vec![
+            &[
                 "init",
                 "--base-url",
                 "https://example.com",
                 "--api-key",
                 "sk-test",
-            ],
-            vec![
+            ][..],
+            &[
                 "init-codex",
                 "--base-url",
                 "https://example.com",
                 "--api-key",
                 "sk-test",
             ],
-            vec!["start"],
-            vec!["restart"],
+            &["start"],
+            &["restart"],
+            &[],
+            &["--verbose"],
+            &["vscode"],
+            &["codex"],
+            &["claude"],
+            &["upstream-proxy", "http://127.0.0.1:7890"],
         ] {
-            let args = args.into_iter().map(String::from).collect::<Vec<_>>();
-            let command = parse_command(&args).unwrap();
+            let command = parse(args);
             let error = refuse_macos_root(&command, 0).unwrap_err().to_string();
-            assert!(error.contains("must not run as root"), "{args:?}: {error}");
             assert!(
-                error.contains(&format!("`{} {}`", BRAND.binary_name, args[0])),
-                "{error}"
+                error.contains("must not run this command as root"),
+                "{args:?}: {error}"
             );
             refuse_macos_root(&command, 501).unwrap();
         }
         for args in [
-            vec!["stop"],
-            vec!["status"],
-            vec!["version"],
-            vec!["uninstall", "--yes"],
+            &["stop"][..],
+            &["status"],
+            &["logs"],
+            &["version"],
+            &["doctor"],
+            &["update"],
+            &["upstream-proxy"],
+            &["uninstall", "--yes"],
         ] {
-            let args = args.into_iter().map(String::from).collect::<Vec<_>>();
-            refuse_macos_root(&parse_command(&args).unwrap(), 0).unwrap();
+            refuse_macos_root(&parse(args), 0).unwrap();
         }
     }
 
