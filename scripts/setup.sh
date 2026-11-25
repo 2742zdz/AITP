@@ -234,6 +234,13 @@ main() {
     [ -n "${base_url}" ] || { usage >&2; die "--base-url is required"; }
   fi
   [ -z "${base_url}" ] || check_url "--base-url" "${base_url}"
+  # macOS: setup writes the current user's profile and loads a LaunchAgent in
+  # that user's login session; root has neither (launchctl gui/0 fails).
+  # Without a working `id`, bash's own EUID decides (never "not root").
+  if [ "${install_only}" = 0 ] && [ "$(uname -s)" = Darwin ] &&
+    [ "$(id -u 2>/dev/null || printf '%s' "${EUID}")" = 0 ]; then
+    die "do not run setup as root (or with sudo) on macOS: leave the root shell (exit) or drop sudo, then run the same command as your normal macOS user"
+  fi
 
   # The manifest of the latest release; the program comes from the release
   # the manifest names (or, for tests, both from one flat directory).

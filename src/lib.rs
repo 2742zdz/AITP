@@ -331,6 +331,9 @@ pub fn run(distribution: &'static Brand, context: RuntimeContext) -> Result<()> 
     let mut args = env::args().skip(1).collect::<Vec<_>>();
     let selector = environment_scope::parse_selector(&mut args)?;
     let command = parse_command(&args)?;
+    // Before the environment is resolved or anything is written.
+    #[cfg(target_os = "macos")]
+    refuse_macos_root(&command, unsafe { libc::geteuid() })?;
     if matches!(command, Command::Uninstall(_)) && selector.is_some() {
         bail!(
             "`{brand_binary} uninstall` covers every {brand_product} environment; remove the environment selector\n\n{USAGE}",
@@ -930,6 +933,44 @@ fn init_claude(args: InitArgs) -> Result<()> {
     start_managed_service_after_initialization(app_config.changed || ca_changed)?;
 
     Ok(())
+}
+
+/// On macOS the background proxy is a LaunchAgent in the logged-in user's GUI
+/// domain. root has no such domain (`launchctl bootstrap gui/0` fails with
+/// "Domain does not support specified action"), and a root setup writes
+/// `/var/root` (or, under sudo keeping HOME, the user's profile as root).
+/// Only commands that neither write a profile nor start the proxy run as
+/// root: reading state, stopping, updating the program and uninstalling (so a
+/// root setup can be cleaned up). Launchers are refused too: `vscode`,
+/// `codex` and `desktop codex` start the service in-process when it is down.
+#[cfg_attr(not(target_os = "macos"), allow(dead_code))]
+fn refuse_macos_root(command: &Command, euid: u32) -> Result<()> {
+    if euid != 0 {
+        return Ok(());
+    }
+    if matches!(
+        command,
+        Command::Help
+            | Command::Version
+            | Command::Status
+            | Command::Stop
+            | Command::Logs
+            | Command::Doctor(_)
+            | Command::ClaudeDesktopDoctor
+            | Command::Update
+            | Command::Uninstall(_)
+            | Command::UpstreamProxy(None)
+    ) {
+        return Ok(());
+    }
+    bail!(
+        "{brand_product} must not run this command as root (or with sudo) on macOS: \
+         it sets up the current user's profile and runs its local proxy as that \
+         user's LaunchAgent, and root has no login session for it. \
+         Leave the root shell (`exit`) or drop `sudo`, then run the command again \
+         as the user signed in to the Mac desktop.",
+        brand_product = BRAND.product_name
+    )
 }
 
 /// Brands with `refuse_foreign_profiles` do not take over a Codex or editor
@@ -11427,6 +11468,57 @@ HTTPS_PROXY="http://127.0.0.1:1111"
             "DO_NOT_TRACK",
         ] {
             assert_eq!(json_str(&env_obj, key), "old", "{key} should be preserved");
+        }
+    }
+
+    #[test]
+    fn macos_root_is_refused_except_for_read_stop_update_and_uninstall() {
+        let parse = |args: &[&str]| {
+            parse_command(&args.iter().map(|arg| arg.to_string()).collect::<Vec<_>>()).unwrap()
+        };
+        for args in [
+            &[
+                "init",
+                "--base-url",
+                "https://example.com",
+                "--api-key",
+                "sk-test",
+            ][..],
+            &[
+                "init-codex",
+                "--base-url",
+                "https://example.com",
+                "--api-key",
+                "sk-test",
+            ],
+            &["start"],
+            &["restart"],
+            &[],
+            &["--verbose"],
+            &["vscode"],
+            &["codex"],
+            &["claude"],
+            &["upstream-proxy", "http://127.0.0.1:7890"],
+        ] {
+            let command = parse(args);
+            let error = refuse_macos_root(&command, 0).unwrap_err().to_string();
+            assert!(
+                error.contains("must not run this command as root"),
+                "{args:?}: {error}"
+            );
+            refuse_macos_root(&command, 501).unwrap();
+        }
+        for args in [
+            &["stop"][..],
+            &["status"],
+            &["logs"],
+            &["version"],
+            &["doctor"],
+            &["update"],
+            &["upstream-proxy"],
+            &["uninstall", "--yes"],
+        ] {
+            refuse_macos_root(&parse(args), 0).unwrap();
         }
     }
 

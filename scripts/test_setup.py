@@ -487,6 +487,16 @@ class BashSetupTests(SetupTests, unittest.TestCase):
         return subprocess.run(arguments, env=environment or self.environment(), capture_output=True, text=True,
                               stdin=subprocess.DEVNULL, timeout=120)
 
+    def test_macos_root_is_refused_before_anything_is_installed(self):
+        fake = self.top / "fake-macos-root"
+        fake.mkdir()
+        for name, output in (("uname", "Darwin"), ("id", "0")):
+            (fake / name).write_text(f"#!/bin/sh\necho {output}\n", encoding="utf-8")
+            (fake / name).chmod(0o755)
+        environment = self.environment()
+        environment["PATH"] = f"{fake}{os.pathsep}{environment['PATH']}"
+        self.assert_failed(self.run_setup(environment=environment), "do not run setup as root")
+
     def run_contract(self):
         # Exactly the documented one-liner (plus the test install directory).
         command = (f'curl -fsSL {self.mirror.releases}/latest/download/setup.sh | {self.bash} -s -- '
