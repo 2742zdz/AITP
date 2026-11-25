@@ -331,6 +331,9 @@ pub fn run(distribution: &'static Brand, context: RuntimeContext) -> Result<()> 
     let mut args = env::args().skip(1).collect::<Vec<_>>();
     let selector = environment_scope::parse_selector(&mut args)?;
     let command = parse_command(&args)?;
+    // Before the environment is resolved or anything is written.
+    #[cfg(target_os = "macos")]
+    refuse_macos_root(&command, unsafe { libc::geteuid() })?;
     if matches!(command, Command::Uninstall(_)) && selector.is_some() {
         bail!(
             "`{brand_binary} uninstall` covers every {brand_product} environment; remove the environment selector\n\n{USAGE}",
@@ -930,6 +933,34 @@ fn init_claude(args: InitArgs) -> Result<()> {
     start_managed_service_after_initialization(app_config.changed || ca_changed)?;
 
     Ok(())
+}
+
+/// On macOS the background proxy is a LaunchAgent in the logged-in user's GUI
+/// domain. root has no such domain (`launchctl bootstrap gui/0` fails with
+/// "Domain does not support specified action"), and a root setup writes
+/// `/var/root/.claude` instead of the user's profile. Refuse the commands
+/// that write a profile or load the agent before they change anything.
+#[cfg_attr(not(target_os = "macos"), allow(dead_code))]
+fn refuse_macos_root(command: &Command, euid: u32) -> Result<()> {
+    if euid != 0 {
+        return Ok(());
+    }
+    let name = match command {
+        Command::Init(_) => "init",
+        Command::InitCodex(_) => "init-codex",
+        Command::Start => "start",
+        Command::Restart => "restart",
+        _ => return Ok(()),
+    };
+    bail!(
+        "`{brand_binary} {name}` must not run as root (or with sudo) on macOS: \
+         {brand_product} sets up the current user's profile and runs its local proxy \
+         as that user's LaunchAgent, and root has no login session for it. \
+         Leave the root shell (`exit`) or drop `sudo`, then run the command again \
+         as your normal macOS user.",
+        brand_binary = BRAND.binary_name,
+        brand_product = BRAND.product_name
+    )
 }
 
 /// Brands with `refuse_foreign_profiles` do not take over a Codex or editor
@@ -11427,6 +11458,47 @@ HTTPS_PROXY="http://127.0.0.1:1111"
             "DO_NOT_TRACK",
         ] {
             assert_eq!(json_str(&env_obj, key), "old", "{key} should be preserved");
+        }
+    }
+
+    #[test]
+    fn macos_root_is_refused_only_for_setup_and_service_start() {
+        for args in [
+            vec![
+                "init",
+                "--base-url",
+                "https://example.com",
+                "--api-key",
+                "sk-test",
+            ],
+            vec![
+                "init-codex",
+                "--base-url",
+                "https://example.com",
+                "--api-key",
+                "sk-test",
+            ],
+            vec!["start"],
+            vec!["restart"],
+        ] {
+            let args = args.into_iter().map(String::from).collect::<Vec<_>>();
+            let command = parse_command(&args).unwrap();
+            let error = refuse_macos_root(&command, 0).unwrap_err().to_string();
+            assert!(error.contains("must not run as root"), "{args:?}: {error}");
+            assert!(
+                error.contains(&format!("`{} {}`", BRAND.binary_name, args[0])),
+                "{error}"
+            );
+            refuse_macos_root(&command, 501).unwrap();
+        }
+        for args in [
+            vec!["stop"],
+            vec!["status"],
+            vec!["version"],
+            vec!["uninstall", "--yes"],
+        ] {
+            let args = args.into_iter().map(String::from).collect::<Vec<_>>();
+            refuse_macos_root(&parse_command(&args).unwrap(), 0).unwrap();
         }
     }
 
